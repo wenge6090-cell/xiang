@@ -1,0 +1,26 @@
+[package]
+name = "xiang-llm"
+version = "0.1.0"
+edition = "2024"
+build = "build.rs"
+
+[dependencies]
+xiang-core = { path = "../xiang-core" }
+num_cpus = "1"
+ureq = { version = "3", features = ["json"], optional = true }
+serde_json = { version = "1", optional = true }
+
+[features]
+default = []
+llama_backend = []
+http_backend = ["dep:ureq", "dep:serde_json"]
+
+[build-dependencies]
+
+[[example]]
+name = "smoke"
+required-features = ["llama_backend"]
+
+[[example]]
+name = "constrained"
+required-features = ["llama_backend"]

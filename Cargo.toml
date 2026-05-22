@@ -1,0 +1,21 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/xiang-core",
+    "crates/xiang-parser",
+    "crates/xiang-cangvm",
+    "crates/xiang-shanvm",
+    "crates/xiang-zhouvm",
+    "crates/xiang-verifier",
+    "crates/xiang-llm",
+    "crates/xiang-experiments",
+    "crates/xiang-chat",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+description = "象 (Xiang) — Three-Yi Intelligent Constraint System based on XiangLang"
+authors = ["Xiang Contributors"]
+

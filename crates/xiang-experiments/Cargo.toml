@@ -1,0 +1,24 @@
+[package]
+name = "xiang-experiments"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "xiang-exp"
+path = "src/main.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+xiang-core = { path = "../xiang-core" }
+xiang-parser = { path = "../xiang-parser" }
+xiang-cangvm = { path = "../xiang-cangvm" }
+xiang-shanvm = { path = "../xiang-shanvm" }
+xiang-zhouvm = { path = "../xiang-zhouvm" }
+xiang-verifier = { path = "../xiang-verifier" }
+xiang-llm = { path = "../xiang-llm" }
+
+[features]
+default = []
+llama_backend = ["xiang-llm/llama_backend"]
+http_backend = ["xiang-llm/http_backend"]

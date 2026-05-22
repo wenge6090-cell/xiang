@@ -1,0 +1,36 @@
+/target
+**/*.rs.bk
+Cargo.lock
+/models
+*.gguf
+*.bin
+
+# Node
+node_modules/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Benchmark output
+benchmark_output/
+
+# Generated files
+tmp_*.json
+
+# Cargo build artifacts per crate
+crates/*/target/
+
+# External dependency - add via git submodule
+llama.cpp/
+
+# Environment
+.env
+.env.*

@@ -1,0 +1,21 @@
+[package]
+name = "xiang-chat"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+xiang-core = { path = "../xiang-core" }
+xiang-cangvm = { path = "../xiang-cangvm" }
+xiang-shanvm = { path = "../xiang-shanvm" }
+xiang-zhouvm = { path = "../xiang-zhouvm" }
+xiang-llm = { path = "../xiang-llm", features = ["http_backend"] }
+
+axum = "0.7"
+tokio = { version = "1", features = ["full"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", features = ["json"] }
+tower-http = { version = "0.5", features = ["cors"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+rand = "0.9"

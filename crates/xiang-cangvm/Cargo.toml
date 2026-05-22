@@ -1,0 +1,11 @@
+[package]
+name = "xiang-cangvm"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+xiang-core = { path = "../xiang-core" }
+xiang-parser = { path = "../xiang-parser" }
+xiang-shanvm = { path = "../xiang-shanvm" }
+xiang-zhouvm = { path = "../xiang-zhouvm" }
+rand = "0.9"
