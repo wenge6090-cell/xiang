@@ -211,7 +211,7 @@ impl YinProtocolChecker {
                     r"(因此|所以|最终|综上所述|我们应该)".to_string(),
                 ],
                 min_length_chars: Some(10),
-                max_length_chars: Some(500),
+                max_length_chars: None,  // v3.5: 移除500字符限制，由max_tokens统一控制
                 structure: None,
             },
         );

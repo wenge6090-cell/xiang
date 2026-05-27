@@ -7,6 +7,13 @@ pub mod deviation;
 pub mod embedding;
 pub mod semantic;
 pub mod yin_checker;
+pub mod constraint_text;
+pub mod context_metabolism;
+pub mod hanzi_table;
+pub mod hanzi_map;
+pub mod hanzi_embeddings;
+pub mod embedding_observer;
+pub mod operator_semantic;
 
 pub use gua::Gua;
 pub use cang_sea::CangSea;
@@ -19,3 +26,10 @@ pub use embedding::{Embedding, MockEncoder, MockEncoderMode, TextEncoder, cosine
 pub use semantic::{StrategyInput, StrategyOutput, SemanticDecision,
                    AttitudeInput, AttitudeOutput, AttitudeEncoder};
 pub use yin_checker::{YinProtocolChecker, OperatorRule, RuleResult, OutputStructure};
+pub use constraint_text::{SAN_YI_CONSTRAINT_FULL_TEXT, DynamicPromptState, build_sanyi_dynamic_prompt, fangwei_strategic_guidance, operator_actionable_guidance};
+pub use context_metabolism::{ContextMetabolism, MetabolismEntry, MetabolismQuality};
+pub use hanzi_table::{HanziEntry, HanziCategory, WuXing, lookup as lookup_hanzi};
+pub use hanzi_map::{HanziMap, HanziMapping};
+pub use hanzi_embeddings::HanziEmbeddings;
+pub use embedding_observer::{EmbeddingObserver, Observation};
+pub use operator_semantic::{OperatorSemanticAnchor, classify_operator_phase, classify_with_scores, build_operator_anchors};
