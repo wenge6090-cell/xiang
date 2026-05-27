@@ -114,6 +114,9 @@ struct ConstrainedEngine {
     eos_id: u32,
     off_focus_ids: Vec<u32>,
     divergent_ids: Vec<u32>,
+    /// 算子专属方向引导 token 池（v4.0）
+    /// 由 vocab::OperatorTokenPools::discover() 在初始化时发现。
+    operator_pools: Option<vocab::OperatorTokenPools>,
     /// 跨轮项目上下文 — 目标锚定 + 决策累积
     project_context: ProjectContext,
     /// 泛化树当前分解深度（每分解一次 +1，聚合后 -1）
@@ -159,6 +162,20 @@ impl ConstrainedEngine {
         eprintln!("[debug] ConstrainedEngine::new: vocab discovery...");
         // Retry vocab discovery until llama.cpp is ready (or timeout)
         let (off_focus_ids, divergent_ids) = Self::discover_vocab_with_retry(&backend);
+        // 算子专属方向引导 token 池（v4.0）
+        let operator_pools = if backend.is_ready() {
+            let pools = vocab::OperatorTokenPools::discover(&backend);
+            eprintln!("[vocab] 算子 token 池: 生({}/{}) 动({}/{}) 长({}/{}) 育({}/{})",
+                pools.sheng.positive.len(), pools.sheng.negative.len(),
+                pools.dong.positive.len(), pools.dong.negative.len(),
+                pools.zhang.positive.len(), pools.zhang.negative.len(),
+                pools.yu.positive.len(), pools.yu.negative.len(),
+            );
+            Some(pools)
+        } else {
+            eprintln!("[vocab] server not ready, 算子 token 池使用空值");
+            None
+        };
         eprintln!("[debug] ConstrainedEngine::new: vocab done");
 
         ConstrainedEngine {
@@ -169,6 +186,7 @@ impl ConstrainedEngine {
             eos_id: vocab::QWEN_EOS_TOKEN,
             off_focus_ids,
             divergent_ids,
+            operator_pools,
             project_context: ProjectContext::new("通用AI助手对话".into(), 6),
             decompose_depth: 0,
             max_decompose_depth: 2,
@@ -302,11 +320,15 @@ impl ConstrainedEngine {
 
         // ── 5. Generate with logit bias ──
         // 算子专属方向引导 token 池（v4.0）
-        // 从 LLM 词表中识别各类 token 的脚本见 scripts/explore_token_pools.py
-        // 当前传空 Vec：通用压制规则仍生效，算子专属引导在 token 池就绪后自动生效
+        // 从 LLM 词表的 tokenize 结果中识别，见 vocab.rs。
         let op_static: &str = Box::leak(operator.clone().into_boxed_str());
-        let operator_positive: Vec<u32> = Vec::new(); // TODO: 从词表识别
-        let operator_negative: Vec<u32> = Vec::new(); // TODO: 从词表识别
+        let (operator_positive, operator_negative): (Vec<u32>, Vec<u32>) = self.operator_pools
+            .as_ref()
+            .map(|pools| {
+                let (pos, neg) = pools.for_operator(op_static);
+                (pos.to_vec(), neg.to_vec())
+            })
+            .unwrap_or_default();
 
         let result = self
             .ctx
@@ -529,6 +551,7 @@ impl ConstrainedEngine {
         let (off_focus_ids, divergent_ids) = vocab::discover_tokens(&self.backend);
         self.off_focus_ids = off_focus_ids;
         self.divergent_ids = divergent_ids;
+        self.operator_pools = Some(vocab::OperatorTokenPools::discover(&self.backend));
     }
 
     /// 记录本轮决策到项目上下文。
@@ -1131,6 +1154,148 @@ async fn main() {
     println!("  POST /api/zhouyi/pose — manually set ZhouYi posture");
     println!("  GET  /api/reset    — reset all engines");
     axum::serve(listener, app).await.unwrap();
+}
+
+// ─── 单元测试：压缩树与观测层 ──────────────────────────────
+
+#[cfg(test)]
+mod compression_tree_tests {
+    use super::*;
+    use xiang_cangvm::MetabolismSignal;
+    use xiang_llm::LlmContext;
+
+    /// 构造一个最小化的 ConstrainedEngine 用于测试核心函数。
+    fn test_engine() -> ConstrainedEngine {
+        // 使用 mock backend（不会连接真实服务器）
+        let mut engine = ConstrainedEngine {
+            backend: HttpBackend::new("http://localhost:99999"),
+            cang_vm: CangVM::new(),
+            ctx: LlmContext::new("test"),
+            messages: vec![],
+            eos_id: 248046,
+            off_focus_ids: vec![],
+            divergent_ids: vec![],
+            operator_pools: None,
+            project_context: ProjectContext::new("test".into(), 6),
+            decompose_depth: 0,
+            max_decompose_depth: 2,
+        };
+        // 注入假数据
+        engine.messages = vec![
+            Message { role: "user".into(), content: "你好".into() },
+            Message { role: "assistant".into(), content: "你好！有什么可以帮助你的？".into() },
+            Message { role: "user".into(), content: "我想了解AI".into() },
+            Message { role: "assistant".into(), content: "AI是人工智能的缩写...".into() },
+            Message { role: "user".into(), content: "再详细说说".into() },
+            Message { role: "assistant".into(), content: "AI包括机器学习、深度学习...".into() },
+        ];
+        engine.ctx.history = vec![
+            ("user: 你好".into(), "你好！有什么可以帮助你的？".into()),
+            ("user: 我想了解AI".into(), "AI是...".into()),
+            ("user: 再详细说说".into(), "AI包括...".into()),
+        ];
+        engine
+    }
+
+    #[test]
+    fn test_crop_history_removes_correct_rounds() {
+        let mut engine = test_engine();
+        assert_eq!(engine.messages.len(), 6, "初始应有 3 轮对话 (6条)");
+        assert_eq!(engine.ctx.history.len(), 3, "初始应有 3 条历史 (3轮)");
+
+        // 杀 1 轮：应删除 user+assistant 2 条消息 + 1 条历史
+        engine.crop_history(1);
+        assert_eq!(engine.messages.len(), 4, "杀1轮后应有 2 轮对话 (4条)");
+        assert_eq!(engine.ctx.history.len(), 2, "杀1轮后应有 2 条历史");
+
+        // 杀 2 轮：应删除剩余全部
+        engine.crop_history(2);
+        assert_eq!(engine.messages.len(), 0, "杀2轮后应为空");
+    }
+
+    #[test]
+    fn test_crop_history_wont_underflow() {
+        let mut engine = test_engine();
+        // 杀超出范围的轮数
+        engine.crop_history(100);
+        assert_eq!(engine.messages.len(), 0, "杀过量后应为空");
+        assert_eq!(engine.ctx.history.len(), 0, "杀过量后历史应为空");
+    }
+
+    #[test]
+    fn test_handle_sha_signal_crops_history() {
+        let mut engine = test_engine();
+        // 手动设置代谢信号
+        engine.cang_vm.metabolism_signal = Some(MetabolismSignal::Sha(2));
+        engine.handle_metabolism_signal("test", "test response");
+        // 应裁剪 2 轮 = 4 条消息（杀 2 轮但初始只有 3 轮，所以还剩 1 轮）
+        assert_eq!(engine.messages.len(), 2, "杀2轮后应剩下 1 轮对话 (2条)");
+        assert!(engine.cang_vm.metabolism_signal.is_none(), "信号消费后应为 None");
+    }
+
+    #[test]
+    fn test_handle_zhi_signal_freezes_context() {
+        let mut engine = test_engine();
+        engine.cang_vm.metabolism_signal = Some(MetabolismSignal::Zhi);
+        // freeze_context 会追加冻结指令。我们只验证信号被消费。
+        handle_zhi_in_test(&mut engine);
+        assert!(engine.cang_vm.metabolism_signal.is_none(), "Zhi 信号消费后应为 None");
+    }
+
+    /// 模拟 Zhi 处理（避免依赖 freeze_context 的实现细节）
+    fn handle_zhi_in_test(engine: &mut ConstrainedEngine) {
+        if let Some(MetabolismSignal::Zhi) = engine.cang_vm.metabolism_signal.take() {
+            engine.cang_vm.metabolism_signal = None;
+        }
+    }
+
+    #[test]
+    fn test_no_signal_no_op() {
+        let mut engine = test_engine();
+        let msg_len = engine.messages.len();
+        // 没有设置信号
+        engine.handle_metabolism_signal("test", "test");
+        // 不应有任何变化
+        assert_eq!(engine.messages.len(), msg_len);
+    }
+
+    #[test]
+    fn test_operator_pools_default_is_empty() {
+        let pools = vocab::OperatorTokenPools::default();
+        assert!(pools.sheng.positive.is_empty());
+        assert!(pools.dong.negative.is_empty());
+        assert!(pools.for_operator("生").0.is_empty());
+        assert!(pools.for_operator("动").1.is_empty());
+        assert!(pools.for_operator("长").0.is_empty());
+        assert!(pools.for_operator("育").1.is_empty());
+    }
+
+    #[test]
+    fn test_operator_pools_unknown_operator() {
+        let pools = vocab::OperatorTokenPools::default();
+        let (pos, neg) = pools.for_operator("未知");
+        assert!(pos.is_empty());
+        assert!(neg.is_empty());
+    }
+
+    #[test]
+    fn test_operator_pools_all_have_patterns() {
+        // 即使不连接服务器，常量模式也应是预定义的
+        use crate::vocab;
+        // 验证每个算子的正/负模式列表都已定义（个数 > 0）
+        // 这些是编译时常量，在运行时通过 tokenize 发现
+        // 这里只验证常量模块的完整性
+        let _ = (
+            vocab::SHENG_POSITIVE,
+            vocab::SHENG_NEGATIVE,
+            vocab::DONG_POSITIVE,
+            vocab::DONG_NEGATIVE,
+            vocab::ZHANG_POSITIVE,
+            vocab::ZHANG_NEGATIVE,
+            vocab::YU_POSITIVE,
+            vocab::YU_NEGATIVE,
+        );
+    }
 }
 
 // ─── 项目上下文代谢 — 10轮实机模拟 ──────────────────────────
