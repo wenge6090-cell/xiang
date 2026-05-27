@@ -1,8 +1,8 @@
 # 路线C：太极双LLM — 三易全链路语义化架构
 
-**版本：2.0** | **难度：⭐⭐⭐** | **状态：远期愿景——语义引擎设计完成，待路线B 跑通后启动**
+**版本：2.2** | **难度：⭐⭐⭐** | **状态：远期愿景——语义引擎设计完成，含完整工程实施计划**
 
-> ⚠️ **本文档描述的是远期架构愿景。** 路线A（归藏引擎 — ✅ 已实现）和路线B（控制原语微调 — 📋 设计完成）是前置步骤。路线C 需要路线B 的微调模型 + 连山/周易引擎接线完成 + 阴仪编码基础设施。
+> ⚠️ **本文档描述的是远期架构愿景，含完整工程实施计划。** 路线A（归藏引擎 — ✅ 已实现）已完成。路线B 和连山/周易接线已解耦为独立任务。路线C 的前置条件是连山/周易流水线接入 + 阴仪编码基础设施，不再依赖路线B 的模型微调。
 >
 > **在三易统一中的位置**：路线C 不是"更大的 归藏"——它是三引擎（归藏/连山/周易）从"离散查表"跃升为"全语义驱动"的完整异步流水线。
 >
@@ -10,8 +10,9 @@
 
 **前置依赖**：
 - ✅ 路线A — 归藏引擎实现（外挂约束）
-- 🔜 路线B — 控制原语微调 + 三引擎流水线接线
-- 🔜 连山/周易 — Rust 代码就绪，12+ 个 crate 覆盖
+- ✅ 连山/周易 ShanVM/ZhouVM — Rust 代码就绪，可独立接线
+- 🔜 连山/周易 流水线接入 — 已从路线B 解耦，可独立执行
+- 🔜 阴仪 TextEncoder — 可独立实现（MockEncoder 先行）
 
 ---
 
@@ -362,8 +363,153 @@ hybrid_deviation(hamming, Some(cosine_dev), alpha)
 
 ---
 
-> **详细实施计划见** → [路线C-实施计划.md](./路线C-实施计划.md)（9 阶段工程步骤 + 代码审计发现）  
-> **当前状态** → [specs/README.md](./README.md)（三引擎实现现状表）
+> **详细实施计划见下文 §九。**
+>
+> **当前状态** → [00-总纲.md](./00-总纲.md)（三引擎实现现状表）
 
 → [路线A：阶段约束](./01-路线A-阶段约束.md)（已完成）  
-→ [路线B：控制原语微调](./02-路线B-控制原语微调.md)（下一阶段）
+→ [路线B：控制原语微调](./02-路线B-控制原语微调.md)（可选路线，硬件升级后执行）
+
+---
+
+## 九、工程实施计划
+
+> 以下内容合并自原 `路线C-实施计划.md`。详细工程步骤、代码审计发现、风险缓解。
+
+### 9.1 设计原则
+
+1. **向后兼容**: 所有新字段为 `Option<T>`，无 encoder 时回退纯 Hamming + 查表
+2. **Mock 先行**: MockEncoder 验证全架构 → 再集成真实 ONNX 模型
+3. **功能对称，体量不对称**: 阳仪 4B 模型，阴仪 100-500M 轻量编码器
+4. **保留现有代码**: ShanVM/ZhouVM 原 struct 不动，语义实现放在同 crate 的 `semantic.rs`
+5. **Trait 在 core，实现分散**: 避免循环依赖，trait 对象注入 CangVM
+
+### 9.2 实现步骤
+
+#### Phase 1: Core Types — 太极基础 (`xiang-core`)
+
+**创建: `crates/xiang-core/src/embedding.rs`**
+- `Embedding` = `Vec<f32>` 类型别名
+- `cosine_similarity(a, b) -> f32`
+- `TextEncoder` trait: `encode(text) -> Embedding`, `dimension()`, `model_name()`
+- `MockEncoder` struct: 确定性伪随机向量（默认 8 维）
+- `MockEncoderMode`: `Focused`, `Drifting`, `Hallucinating`
+
+**创建: `crates/xiang-core/src/semantic.rs`**
+- `StrategyInput { v_goal, v_obstacle, c_history }` — 连山输入
+- `StrategyOutput { v_strategy, projected: FangWei, confidence }` — 连山输出
+- `SemanticDecision` trait: `decide(input) -> StrategyOutput`
+- `AttitudeInput { v_origin, v_strategy }` — 周易输入
+- `AttitudeOutput { v_attitude, temperature, pose: Bagua, prompt_prefix, attention_bias }`
+- `AttitudeEncoder` trait: `encode_attitude(input) -> AttitudeOutput`
+
+**修改: `crates/xiang-core/src/deviation.rs`**
+- 新增 `hybrid_deviation(hamming, semantic_option, alpha) -> f32`
+- 新增 `DeviationSource` 枚举
+
+**修改: `crates/xiang-core/src/cang_sea.rs`**
+- 新增 `SemanticEntry` struct 和 `SemanticStore` struct
+- 核心方法: `store_semantic()`, `query_similar_*()`, `query_immune_similar()`, `merge_similar()`
+- `CangSea` 新增 `semantic_store: Option<SemanticStore>` 字段
+
+#### Phase 2: Mock Encoder (`xiang-encoder` crate)
+
+**新建 crate: `crates/xiang-encoder/`** → `MockEncoder`: 实现 `TextEncoder`
+
+#### Phase 3: 连山语义化 (`xiang-shanvm`)
+
+**创建: `crates/xiang-shanvm/src/semantic.rs`**
+- 7 个基础策略向量 `BASE_STRATEGIES`（对应 FangWei 7 方向）
+- `SemanticLianShan<E: TextEncoder>` struct → mock k-NN + 加权插值策略
+
+#### Phase 4: 周易语义化 (`xiang-zhouvm`)
+
+**创建: `crates/xiang-zhouvm/src/semantic.rs`**
+- 8 个基础姿态向量 `BASE_ATTITUDES`（对应 8 卦）
+- `SemanticZhouYi<E: TextEncoder>` struct → V_origin + V_strategy 插值
+
+#### Phase 5: CangVM 接线 (`xiang-cangvm`)
+
+`CangVM` 新增字段: `semantic_origin`, `semantic_deviation`, `deviation_alpha`, `semantic_lianshan`, `semantic_zhouyi`, `text_encoder`
+- `execute_lianshan_op()` — 替换原 no-op
+- `execute_zhouyi_op()` — 替换原 no-op
+- `current_deviation()` 改写 → 调用 `hybrid_deviation()`
+
+#### Phase 6: 完整语义周天 — 10 步认知循环
+
+`ZhouTianRunner::run_cycle()` 升级为 10 步语义循环（gated on `semantic_mode`）：
+1. 生 → 编码 goal+obstacle → 检索藏海 → 设置启发态
+2. 动 → 记录当前思维轨迹
+3. 归 → hybrid_deviation（偏离 > 0.9 则终止）
+4. 长 → 精炼目标向量
+5. 连山介入 → 语义策略决策
+6. 周易介入 → 语义姿态选择 + temperature + prompt_prefix
+7. 育 → 偏离 > 0.7 触发中期剪除
+8. 杀 → Gua 层级剪除
+9. 止 → 边界凝固
+10. 藏 → 写入 SemanticStore + Legacy Matrix
+
+**向后兼容**: `semantic_mode == false` 时回退当前 3-phase 8-step。
+
+#### Phase 7: LogitBias 升级 (`xiang-llm`)
+
+`XiangLogitBias` 新增: `hamming_deviation`, `semantic_deviation`, `v_strategy`, `v_attitude`
+
+#### Phase 8: 杀硬逻辑 — 物理 Token 丢弃 (`xiang-llm` + `xiang-experiments`)
+
+杀触发时 token 物理丢弃，不进入上下文历史。重构 `generate_constrained_turn()` 为条件 add_turn 路径。
+
+#### Phase 9: ExperimentRunner 集成 (`xiang-experiments`)
+
+`ExperimentConfig` 新增: `use_encoder`, `encoder_dim`, `semantic_mode`, `merge_threshold`
+CLI: `--encoder`, `--encoder-dim`, `--alpha`, `--semantic`
+
+### 9.3 关键文件清单
+
+| 操作 | 文件 | 说明 |
+|------|------|------|
+| CREATE | `crates/xiang-core/src/embedding.rs` | TextEncoder trait + MockEncoder |
+| CREATE | `crates/xiang-core/src/semantic.rs` | SemanticDecision + AttitudeEncoder traits |
+| MODIFY | `crates/xiang-core/src/deviation.rs` | hybrid_deviation() |
+| MODIFY | `crates/xiang-core/src/cang_sea.rs` | SemanticStore + SemanticEntry |
+| CREATE | `crates/xiang-encoder/` | 新 crate (MockEncoder) |
+| CREATE | `crates/xiang-shanvm/src/semantic.rs` | SemanticLianShan |
+| CREATE | `crates/xiang-zhouvm/src/semantic.rs` | SemanticZhouYi |
+| MODIFY | `crates/xiang-cangvm/src/vm.rs` | 接线 + 10步语义循环 |
+| MODIFY | `crates/xiang-llm/src/lib.rs` | LogitBias + 物理丢弃 |
+| MODIFY | `crates/xiang-experiments/src/lib.rs` | 三引擎集成 |
+| MODIFY | `Cargo.toml` | 添加 xiang-encoder 成员 |
+
+### 9.4 代码审计发现
+
+| 发现 | 影响 | 决策 |
+|------|------|------|
+| CangSea 全部字段 private | 验证了设计 | SemanticStore 作为独立公开扩展字段 |
+| FangWei::WaitGather 是死代码 | 7方向中1个不可达 | 语义连山激活此路径（免疫模糊匹配）|
+| LlmContext::add_turn() 无条件调用 | 与物理丢弃冲突 | Phase 8 条件 add_turn 重构 |
+| ShanVM.decision_log 未被读取 | 历史决策闲置 | 语义连山反循环检测 |
+| Gua::ORIGIN 注释已指向动态化 | 代码已为语义化准备 | Phase 5 set_semantic_origin() |
+
+### 9.5 验证方法
+
+**单元测试**: embedding.rs cosine 验证、deviation.rs hybrid 回退、cang_sea.rs 免疫区隔离与合并
+
+**集成测试**:
+- `test_taiji_fallback`: semantic_mode=false 行为一致
+- `test_taiji_mock_hybrid`: MockEncoder(Focused) → hybrid < 0.2
+- `test_taiji_mock_drifting`: 3轮偏差递增
+- `test_taiji_lian_shan_wired`: 连山输出有效
+- `test_taiji_zhou_yi_wired`: 周易输出有效
+- `test_taiji_physical_discard`: 杀触发 token 不入 history
+- `test_taiji_immune_memory`: 负 reward → immune_zone 命中
+- `test_taiji_merge_crystal`: 高相似度合并
+
+### 9.6 风险与缓解
+
+| 风险 | 缓解 |
+|------|------|
+| `generate_constrained_turn` 签名变化影响调用者 | 签名不变，内部 self 状态管理 |
+| SemanticStore 与 Legacy Matrix 数据不一致 | 每次藏同时写两边；检索 Semantic 优先 |
+| MockEncoder 确定性不足 | 确定性哈希 → 单位向量 |
+| CangVM 字段膨胀 | 全部 Option，semantic_mode=false 时零开销 |
+| 免疫区无限增长 | immune_zone_max=1000，超限时内部 merge 不驱逐 |
