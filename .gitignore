@@ -29,6 +29,9 @@ experiment_runs/
 __pycache__/
 *.pyc
 
+# Windows reserved name artifact
+nul
+
 # Generated files
 tmp_*.json
 
