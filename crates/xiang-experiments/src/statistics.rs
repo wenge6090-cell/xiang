@@ -265,10 +265,34 @@ pub struct BenchmarkSummary {
     pub trust_controlled: MetricStats,
     pub trust_constrained: MetricStats,
     pub trust_test: TTestResult,
+
+    // ── AI 语义质量评估 (optional) ──
+    pub quality_overall_controlled: Option<MetricStats>,
+    pub quality_overall_constrained: Option<MetricStats>,
+    pub quality_overall_test: Option<TTestResult>,
+    pub quality_completion_controlled: Option<MetricStats>,
+    pub quality_completion_constrained: Option<MetricStats>,
+    pub quality_completion_test: Option<TTestResult>,
+    pub quality_coherence_controlled: Option<MetricStats>,
+    pub quality_coherence_constrained: Option<MetricStats>,
+    pub quality_coherence_test: Option<TTestResult>,
+    pub quality_relevance_controlled: Option<MetricStats>,
+    pub quality_relevance_constrained: Option<MetricStats>,
+    pub quality_relevance_test: Option<TTestResult>,
+    pub quality_depth_controlled: Option<MetricStats>,
+    pub quality_depth_constrained: Option<MetricStats>,
+    pub quality_depth_test: Option<TTestResult>,
+    pub quality_structure_controlled: Option<MetricStats>,
+    pub quality_structure_constrained: Option<MetricStats>,
+    pub quality_structure_test: Option<TTestResult>,
 }
 
 /// Compute the full benchmark summary from all trials.
-pub fn compute_benchmark_summary(trials: &[BenchmarkTrial]) -> BenchmarkSummary {
+/// Optionally includes quality evaluation statistics if `quality_report` is provided.
+pub fn compute_benchmark_summary(
+    trials: &[BenchmarkTrial],
+    quality_report: Option<&crate::QualityEvaluationReport>,
+) -> BenchmarkSummary {
     let _n = trials.len();
 
     // Extract metric vectors
@@ -300,7 +324,71 @@ pub fn compute_benchmark_summary(trials: &[BenchmarkTrial]) -> BenchmarkSummary 
         trust_controlled: compute_metric_stats(&trust_c),
         trust_constrained: compute_metric_stats(&trust_x),
         trust_test: welch_t_test(&trust_c, &trust_x),
+
+        quality_overall_controlled: quality_report.map(quality_ctrl_avg),
+        quality_overall_constrained: quality_report.map(quality_expr_avg),
+        quality_overall_test: quality_report.map(quality_ttest),
+        quality_completion_controlled: quality_report.map(|qr| dim_avg(qr, |e| &e.controlled_per_turn, |s| s.task_completion)),
+        quality_completion_constrained: quality_report.map(|qr| dim_avg(qr, |e| &e.constrained_per_turn, |s| s.task_completion)),
+        quality_completion_test: quality_report.map(|qr| dim_ttest(qr, |s| s.task_completion)),
+        quality_coherence_controlled: quality_report.map(|qr| dim_avg(qr, |e| &e.controlled_per_turn, |s| s.logical_coherence)),
+        quality_coherence_constrained: quality_report.map(|qr| dim_avg(qr, |e| &e.constrained_per_turn, |s| s.logical_coherence)),
+        quality_coherence_test: quality_report.map(|qr| dim_ttest(qr, |s| s.logical_coherence)),
+        quality_relevance_controlled: quality_report.map(|qr| dim_avg(qr, |e| &e.controlled_per_turn, |s| s.content_relevance)),
+        quality_relevance_constrained: quality_report.map(|qr| dim_avg(qr, |e| &e.constrained_per_turn, |s| s.content_relevance)),
+        quality_relevance_test: quality_report.map(|qr| dim_ttest(qr, |s| s.content_relevance)),
+        quality_depth_controlled: quality_report.map(|qr| dim_avg(qr, |e| &e.controlled_per_turn, |s| s.analysis_depth)),
+        quality_depth_constrained: quality_report.map(|qr| dim_avg(qr, |e| &e.constrained_per_turn, |s| s.analysis_depth)),
+        quality_depth_test: quality_report.map(|qr| dim_ttest(qr, |s| s.analysis_depth)),
+        quality_structure_controlled: quality_report.map(|qr| dim_avg(qr, |e| &e.controlled_per_turn, |s| s.structural_clarity)),
+        quality_structure_constrained: quality_report.map(|qr| dim_avg(qr, |e| &e.constrained_per_turn, |s| s.structural_clarity)),
+        quality_structure_test: quality_report.map(|qr| dim_ttest(qr, |s| s.structural_clarity)),
     }
+}
+
+/// Controlled-group overall quality average.
+fn quality_ctrl_avg(report: &crate::QualityEvaluationReport) -> MetricStats {
+    let vals: Vec<f64> = report.evaluations.iter().map(|e| e.controlled_overall as f64).collect();
+    compute_metric_stats(&vals)
+}
+
+/// Constrained-group overall quality average.
+fn quality_expr_avg(report: &crate::QualityEvaluationReport) -> MetricStats {
+    let vals: Vec<f64> = report.evaluations.iter().map(|e| e.constrained_overall as f64).collect();
+    compute_metric_stats(&vals)
+}
+
+/// Overall quality t-test.
+fn quality_ttest(report: &crate::QualityEvaluationReport) -> TTestResult {
+    let ctrl: Vec<f64> = report.evaluations.iter().map(|e| e.controlled_overall as f64).collect();
+    let expr: Vec<f64> = report.evaluations.iter().map(|e| e.constrained_overall as f64).collect();
+    welch_t_test(&ctrl, &expr)
+}
+
+/// Average a per-dimension score across all turns in all trials.
+fn dim_avg<F, G>(report: &crate::QualityEvaluationReport, group: F, dim: G) -> MetricStats
+where
+    F: Fn(&crate::QualityEvaluation) -> &Vec<crate::QualityScores>,
+    G: Fn(&crate::QualityScores) -> f32,
+{
+    let vals: Vec<f64> = report.evaluations.iter()
+        .flat_map(|e| group(e).iter().map(|s| dim(s) as f64))
+        .collect();
+    compute_metric_stats(&vals)
+}
+
+/// Welch t-test on a per-dimension score between controlled and constrained.
+fn dim_ttest<G>(report: &crate::QualityEvaluationReport, dim: G) -> TTestResult
+where
+    G: Fn(&crate::QualityScores) -> f32 + Copy,
+{
+    let ctrl: Vec<f64> = report.evaluations.iter()
+        .flat_map(|e| e.controlled_per_turn.iter().map(|s| dim(s) as f64))
+        .collect();
+    let expr: Vec<f64> = report.evaluations.iter()
+        .flat_map(|e| e.constrained_per_turn.iter().map(|s| dim(s) as f64))
+        .collect();
+    welch_t_test(&ctrl, &expr)
 }
 
 #[cfg(test)]

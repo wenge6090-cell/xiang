@@ -7,7 +7,7 @@
 //! Collects per-trial metrics and delegates statistical analysis to the statistics module.
 
 use crate::{
-    ExperimentRunner, ExperimentMetrics, ExperimentConfig, TurnMetrics,
+    ExperimentRunner, ExperimentMetrics, ExperimentConfig, focus_deviation_experiment,
     statistics::{BenchmarkSummary, compute_benchmark_summary},
     create_backend,
 };
@@ -43,6 +43,9 @@ pub struct BenchmarkResults {
     pub summary: BenchmarkSummary,
     pub model_name: String,
     pub backend_type: String,
+    /// Optional quality evaluation report from AI evaluator.
+    #[serde(skip)]
+    pub quality_report: Option<crate::QualityEvaluationReport>,
 }
 
 /// The benchmark runner orchestrates all trials.
@@ -141,7 +144,7 @@ impl BenchmarkRunner {
                       ctrl_turns, const_turns);
         }
 
-        let summary = compute_benchmark_summary(&trials);
+        let summary = compute_benchmark_summary(&trials, None);
 
         Ok(BenchmarkResults {
             num_trials: n,
@@ -149,60 +152,16 @@ impl BenchmarkRunner {
             summary,
             model_name,
             backend_type,
+            quality_report: None,
         })
-    }
-
-    /// Format a single turn's metrics into a structured text block.
-    fn format_turn_content(turn: &TurnMetrics, turn_index: usize) -> String {
-        format!(
-            "=== 轮次 {turn_index} ===\n\
-             ── 思考过程 ──\n\
-             卦象状态:   {gua}\n\
-             偏离率:     {dev}\n\
-             语义偏离:   {sem}\n\
-             温度策略:   {temp}\n\
-             阶段算子:   {op}\n\
-             阶段合规:   {phase}\n\
-             停止原因:   {stop}\n\
-             ── 干预手段 ──\n\
-             Token压制:  {sup}\n\
-             Bias应用:   {bias}\n\
-             焦点干预:   {fi}\n\
-             SHA触发:    {sha}\n\
-             重复检测:   {rep}\n\
-             藏标签:     {label}\n\
-             阶段违规:   {violations}\n\
-             ── 生成输出（全文）──\n\
-             {text}",
-            turn_index = turn_index,
-            gua = turn.vm_gua_state.map_or("N/A".into(), |g| format!("{:06b}", g)),
-            dev = format!("{:.4}", turn.deviation),
-            sem = turn.semantic_deviation.map_or("N/A".into(), |v| format!("{:.4}", v)),
-            temp = format!("{:.2}", turn.temperature_used),
-            op = turn.operator_checked.as_deref().unwrap_or("N/A"),
-            phase = turn.phase_valid.map_or("N/A".into(), |v| if v { "通过" } else { "违规" }),
-            stop = turn.stop_reason.as_deref().unwrap_or("N/A"),
-            sup = turn.tokens_suppressed,
-            bias = turn.bias_applications,
-            fi = if turn.focus_intervened { "是" } else { "否" },
-            sha = if turn.sha_triggered { "是" } else { "否" },
-            rep = if turn.repetition_triggered { "是" } else { "否" },
-            label = turn.cang_label.as_deref().unwrap_or("N/A"),
-            violations = if turn.phase_violations.is_empty() {
-                "无".into()
-            } else {
-                turn.phase_violations.join("; ")
-            },
-            text = turn.generated_text_preview,
-        )
     }
 
     /// Write per-turn output files for a single trial.
     /// Directory structure:
     ///   benchmark_output/trial_{i}/
     ///     input.txt
-    ///     controlled/turn_000.txt  (each turn's generated text with full metrics)
-    ///     constrained/turn_000.txt
+    ///     对照组/turn_000.txt  (each turn's generated text with full metrics)
+    ///     实验组/turn_000.txt
     fn write_turn_files(
         output_dir: &PathBuf,
         trial_index: usize,
@@ -222,26 +181,26 @@ impl BenchmarkRunner {
         })?;
 
         // Write controlled turn files
-        let ctrl_dir = trial_dir.join("controlled");
+        let ctrl_dir = trial_dir.join("对照组");
         fs::create_dir_all(&ctrl_dir).map_err(|e| {
             LlmError::GenerationFailed(format!("无法创建输出目录: {}", e))
         })?;
         for (j, turn) in controlled.turn_data.iter().enumerate() {
-            let turn_file = ctrl_dir.join(format!("turn_{:03}.txt", j));
-            let content = Self::format_turn_content(turn, j);
+            let turn_file = ctrl_dir.join(crate::turn_filename(turn, j));
+            let content = crate::format_turn_content(turn, j);
             fs::write(&turn_file, content).map_err(|e| {
                 LlmError::GenerationFailed(format!("无法写入轮次文件: {}", e))
             })?;
         }
 
         // Write constrained turn files
-        let const_dir = trial_dir.join("constrained");
+        let const_dir = trial_dir.join("实验组");
         fs::create_dir_all(&const_dir).map_err(|e| {
             LlmError::GenerationFailed(format!("无法创建输出目录: {}", e))
         })?;
         for (j, turn) in constrained.turn_data.iter().enumerate() {
-            let turn_file = const_dir.join(format!("turn_{:03}.txt", j));
-            let content = Self::format_turn_content(turn, j);
+            let turn_file = const_dir.join(crate::turn_filename(turn, j));
+            let content = crate::format_turn_content(turn, j);
             fs::write(&turn_file, content).map_err(|e| {
                 LlmError::GenerationFailed(format!("无法写入轮次文件: {}", e))
             })?;
@@ -275,6 +234,296 @@ impl BenchmarkRunner {
     }
 }
 
+/// Run a three-way benchmark comparing 约束组, 微调组, and 原生组.
+///
+/// The benchmark runs two sequential model passes:
+///   1. RouteB model → obtains 约束组 (silent engine) + 微调组 (bare)
+///   2. Base model  → obtains 原生组 (bare)
+///
+/// Returns (yue_shu_results, wei_diao_results, yuan_sheng_results) — three BenchmarkResults
+/// where each carries the correct metrics in the appropriate fields.
+pub fn run_threeway_bench(
+    num_trials: usize,
+    inputs: Vec<String>,
+    routeb_model_path: &str,
+    base_model_path: &str,
+    max_tokens: u32,
+    _seed: u64,
+) -> Result<(BenchmarkResults, BenchmarkResults, BenchmarkResults), LlmError> {
+    let n = num_trials.min(inputs.len());
+    let output_dir = PathBuf::from("threeway_benchmark_output");
+    let bench_start = std::time::Instant::now();
+
+    // Extract model names from paths
+    let model_name_routeb = std::path::Path::new(routeb_model_path)
+        .file_name().map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "RouteB".into());
+    let model_name_base = std::path::Path::new(base_model_path)
+        .file_name().map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| "Base".into());
+
+    // ── Phase 1: RouteB model (约束组 + 微调组) ──
+    eprintln!("\n=== 第一阶段: 路线B微调模型 (约束组 + 微调组) ===");
+    eprintln!("模型: {}", routeb_model_path);
+
+    let mut routeb_cfg = make_experiment_config(routeb_model_path, max_tokens);
+    routeb_cfg.inputs = inputs.iter().take(n).cloned().collect();
+    let mut routeb_backend = create_backend(&routeb_cfg)?;
+
+    // Discover vocab once for RouteB
+    let (off, div, eos) = routeb_backend.discover_vocab();
+    routeb_cfg.cached_off_focus_ids = Some(off);
+    routeb_cfg.cached_divergent_ids = Some(div);
+    routeb_cfg.cached_eos_id = Some(eos);
+
+    let mut yue_shu_metrics: Vec<ExperimentMetrics> = Vec::with_capacity(n);
+    let mut wei_diao_metrics: Vec<ExperimentMetrics> = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let input = &routeb_cfg.inputs[i];
+
+        // ── 约束组: RouteB + 静默引擎 (logit bias only, no text prompts) ──
+        routeb_backend.reset_for_new_generation();
+        let mut yue_shu_cfg = routeb_cfg.clone();
+        yue_shu_cfg.use_guidance_engine = true;
+        yue_shu_cfg.inject_constraint_prompt = false;
+        yue_shu_cfg.enable_three_engine = true;
+        yue_shu_cfg.phase_constraint_mode = true;
+        yue_shu_cfg.inputs = vec![input.clone()];
+
+        let yue_shu = ExperimentRunner::run_constrained_with_backend(
+            &yue_shu_cfg, &mut routeb_backend,
+        ).unwrap_or_else(|e| {
+            eprintln!("[WARN] 试验#{i} 约束组失败: {e}");
+            ExperimentMetrics::default()
+        });
+
+        // ── 微调组: RouteB + 裸问题 (无引擎引导) ──
+        routeb_backend.reset_for_new_generation();
+        let mut wei_diao_cfg = routeb_cfg.clone();
+        wei_diao_cfg.use_guidance_engine = false;
+        wei_diao_cfg.enable_three_engine = false;
+        wei_diao_cfg.phase_constraint_mode = false;
+        wei_diao_cfg.inputs = vec![input.clone()];
+
+        let wei_diao = ExperimentRunner::run_controlled_with_backend(
+            &wei_diao_cfg, &mut routeb_backend,
+        ).unwrap_or_else(|e| {
+            eprintln!("[WARN] 试验#{i} 微调组失败: {e}");
+            ExperimentMetrics::default()
+        });
+
+        yue_shu_metrics.push(yue_shu);
+        wei_diao_metrics.push(wei_diao);
+
+        let elapsed = bench_start.elapsed();
+        eprintln!("  试验#{i} ({:.0}s) 约束组_轮={} 微调组_轮={}",
+            elapsed.as_secs_f64(),
+            yue_shu_metrics.last().unwrap().total_generations,
+            wei_diao_metrics.last().unwrap().total_generations);
+    }
+
+    // ── Phase 2: Base model (原生组) ──
+    eprintln!("\n=== 第二阶段: 基础模型 (原生组) ===");
+    eprintln!("模型: {}", base_model_path);
+
+    let mut base_cfg = make_experiment_config(base_model_path, max_tokens);
+    base_cfg.inputs = inputs.iter().take(n).cloned().collect();
+    let mut base_backend = create_backend(&base_cfg)?;
+
+    let (boff, bdiv, beos) = base_backend.discover_vocab();
+    base_cfg.cached_off_focus_ids = Some(boff);
+    base_cfg.cached_divergent_ids = Some(bdiv);
+    base_cfg.cached_eos_id = Some(beos);
+
+    let mut yuan_sheng_metrics: Vec<ExperimentMetrics> = Vec::with_capacity(n);
+
+    for i in 0..n {
+        let input = &base_cfg.inputs[i];
+
+        // ── 原生组: 基础模型 + 裸问题 (基线) ──
+        base_backend.reset_for_new_generation();
+        let mut yuan_sheng_cfg = base_cfg.clone();
+        yuan_sheng_cfg.use_guidance_engine = false;
+        yuan_sheng_cfg.enable_three_engine = false;
+        yuan_sheng_cfg.phase_constraint_mode = false;
+        yuan_sheng_cfg.inputs = vec![input.clone()];
+
+        let yuan_sheng = ExperimentRunner::run_controlled_with_backend(
+            &yuan_sheng_cfg, &mut base_backend,
+        ).unwrap_or_else(|e| {
+            eprintln!("[WARN] 试验#{i} 原生组失败: {e}");
+            ExperimentMetrics::default()
+        });
+
+        yuan_sheng_metrics.push(yuan_sheng);
+
+        let elapsed = bench_start.elapsed();
+        eprintln!("  试验#{i} ({:.0}s) 原生组_轮={}",
+            elapsed.as_secs_f64(),
+            yuan_sheng_metrics.last().unwrap().total_generations);
+    }
+
+    // ── Construct BenchmarkResults for each group ──
+    let yue_shu_trials: Vec<BenchmarkTrial> = (0..n).map(|i| BenchmarkTrial {
+        trial_index: i,
+        input: routeb_cfg.inputs[i].clone(),
+        controlled_metrics: ExperimentMetrics::default(),
+        constrained_metrics: yue_shu_metrics[i].clone(),
+    }).collect();
+
+    let wei_diao_trials: Vec<BenchmarkTrial> = (0..n).map(|i| BenchmarkTrial {
+        trial_index: i,
+        input: routeb_cfg.inputs[i].clone(),
+        controlled_metrics: wei_diao_metrics[i].clone(),
+        constrained_metrics: ExperimentMetrics::default(),
+    }).collect();
+
+    let yuan_sheng_trials: Vec<BenchmarkTrial> = (0..n).map(|i| BenchmarkTrial {
+        trial_index: i,
+        input: base_cfg.inputs[i].clone(),
+        controlled_metrics: yuan_sheng_metrics[i].clone(),
+        constrained_metrics: ExperimentMetrics::default(),
+    }).collect();
+
+    let yue_shu_summary = compute_benchmark_summary(&yue_shu_trials, None);
+    let wei_diao_summary = compute_benchmark_summary(&wei_diao_trials, None);
+    let yuan_sheng_summary = compute_benchmark_summary(&yuan_sheng_trials, None);
+
+    let yue_shu_results = BenchmarkResults {
+        num_trials: n,
+        trials: yue_shu_trials,
+        summary: yue_shu_summary,
+        model_name: model_name_routeb.clone(),
+        backend_type: "llama.cpp FFI".into(),
+        quality_report: None,
+    };
+
+    let wei_diao_results = BenchmarkResults {
+        num_trials: n,
+        trials: wei_diao_trials,
+        summary: wei_diao_summary,
+        model_name: model_name_routeb.clone(),
+        backend_type: "llama.cpp FFI".into(),
+        quality_report: None,
+    };
+
+    let yuan_sheng_results = BenchmarkResults {
+        num_trials: n,
+        trials: yuan_sheng_trials,
+        summary: yuan_sheng_summary,
+        model_name: model_name_base,
+        backend_type: "llama.cpp FFI".into(),
+        quality_report: None,
+    };
+
+    // ── Write three-group turn files ──
+    write_threeway_turn_files(&output_dir, &yue_shu_metrics, &wei_diao_metrics, &yuan_sheng_metrics, &inputs[..n])?;
+
+    eprintln!("\n=== 三组基准测试完成 ({:.0}s) ===", bench_start.elapsed().as_secs_f64());
+    eprintln!("  约束组: RouteB + 静默引擎 (logit bias only, 无体系提示词)");
+    eprintln!("  微调组: RouteB + 裸问题 (无引擎)");
+    eprintln!("  原生组: 基础模型 + 裸问题 (基线)");
+    eprintln!("  输出目录: {}", output_dir.display());
+
+    Ok((yue_shu_results, wei_diao_results, yuan_sheng_results))
+}
+
+/// Create an ExperimentConfig for a model with standard three-way benchmark settings.
+fn make_experiment_config(model_path: &str, max_tokens: u32) -> ExperimentConfig {
+    let mut cfg = focus_deviation_experiment();
+    cfg.model_path = Some(model_path.to_string());
+    cfg.semantic_mode = true;
+    cfg.deviation_alpha = 0.5;
+    cfg.turns = 10;
+    cfg.max_tokens = max_tokens;
+    cfg.agent_mode = true;
+    cfg.agent_stop_patterns = vec![
+        "### DONE".into(),
+        "任务完成".into(),
+        "分析结束".into(),
+    ];
+    cfg.repetition_detection_enabled = true;
+    cfg.repetition_threshold = 3;
+    cfg.repetition_similarity_threshold = 0.85;
+    cfg.repetition_window_size = 3;
+    cfg
+}
+
+/// Write three-group turn files for all trials.
+///
+/// Directory structure:
+///   threeway_benchmark_output/trial_{i}/
+///     input.txt
+///     约束组/turn_000.txt  (silent engine turns)
+///     微调组/turn_000.txt  (bare RouteB turns)
+///     原生组/turn_000.txt  (bare base model turns)
+fn write_threeway_turn_files(
+    output_dir: &PathBuf,
+    yue_shu_metrics: &[ExperimentMetrics],
+    wei_diao_metrics: &[ExperimentMetrics],
+    yuan_sheng_metrics: &[ExperimentMetrics],
+    inputs: &[String],
+) -> Result<(), LlmError> {
+    let n = yue_shu_metrics.len()
+        .min(wei_diao_metrics.len())
+        .min(yuan_sheng_metrics.len())
+        .min(inputs.len());
+
+    for i in 0..n {
+        let trial_dir = output_dir.join(format!("trial_{}", i));
+        fs::create_dir_all(&trial_dir).map_err(|e| {
+            LlmError::GenerationFailed(format!("无法创建输出目录: {}", e))
+        })?;
+
+        // Write input file
+        fs::write(trial_dir.join("input.txt"), &inputs[i]).map_err(|e| {
+            LlmError::GenerationFailed(format!("无法写入输入文件: {}", e))
+        })?;
+
+        // 约束组
+        let yue_shu_dir = trial_dir.join("约束组");
+        fs::create_dir_all(&yue_shu_dir).map_err(|e| {
+            LlmError::GenerationFailed(format!("无法创建约束组目录: {}", e))
+        })?;
+        for (j, turn) in yue_shu_metrics[i].turn_data.iter().enumerate() {
+            let turn_file = yue_shu_dir.join(crate::turn_filename(turn, j));
+            let content = crate::format_turn_content(turn, j);
+            fs::write(&turn_file, content).map_err(|e| {
+                LlmError::GenerationFailed(format!("无法写入约束组轮次文件: {}", e))
+            })?;
+        }
+
+        // 微调组
+        let wei_diao_dir = trial_dir.join("微调组");
+        fs::create_dir_all(&wei_diao_dir).map_err(|e| {
+            LlmError::GenerationFailed(format!("无法创建微调组目录: {}", e))
+        })?;
+        for (j, turn) in wei_diao_metrics[i].turn_data.iter().enumerate() {
+            let turn_file = wei_diao_dir.join(crate::turn_filename(turn, j));
+            let content = crate::format_turn_content(turn, j);
+            fs::write(&turn_file, content).map_err(|e| {
+                LlmError::GenerationFailed(format!("无法写入微调组轮次文件: {}", e))
+            })?;
+        }
+
+        // 原生组
+        let yuan_sheng_dir = trial_dir.join("原生组");
+        fs::create_dir_all(&yuan_sheng_dir).map_err(|e| {
+            LlmError::GenerationFailed(format!("无法创建原生组目录: {}", e))
+        })?;
+        for (j, turn) in yuan_sheng_metrics[i].turn_data.iter().enumerate() {
+            let turn_file = yuan_sheng_dir.join(crate::turn_filename(turn, j));
+            let content = crate::format_turn_content(turn, j);
+            fs::write(&turn_file, content).map_err(|e| {
+                LlmError::GenerationFailed(format!("无法写入原生组轮次文件: {}", e))
+            })?;
+        }
+    }
+
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -287,9 +536,10 @@ mod tests {
             guidance_program: Some("定义 测试:\n    卦 状态 = 111111\n    生\n    动\n    归\n    藏 善".into()),
             inputs: vec![],
             turns: 1,
-            max_tokens: 30,
+            max_tokens: 400,
             mock_mode: xiang_llm::MockMode::OffFocus,
             use_guidance_engine: true,
+            inject_constraint_prompt: true,
             model_path: None,
             http_server_url: None,
             off_focus_token_ids: vec![],
@@ -308,6 +558,7 @@ mod tests {
             repetition_threshold: 3,
             repetition_similarity_threshold: 0.85,
             repetition_window_size: 3,
+            semantic_nav_mode: false,
         }
     }
 
