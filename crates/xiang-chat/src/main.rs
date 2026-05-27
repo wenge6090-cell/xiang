@@ -7,9 +7,10 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use std::sync::{Arc, Mutex};
 use tower_http::cors::CorsLayer;
-use xiang_cangvm::CangVM;
+use xiang_cangvm::{CangVM, MetabolismSignal};
 use xiang_core::{CangSea, ProjectContext};
 use xiang_core::Gua;
+use xiang_core::{EmbeddingObserver, HanziMap};
 use xiang_llm::http_backend::HttpBackend;
 use xiang_llm::{LlmBackend, LlmContext, TemperatureMode};
 use xiang_shanvm::ShanVM;
@@ -32,7 +33,7 @@ impl RawEngine {
     fn new() -> Self {
         RawEngine {
             backend: HttpBackend::new(LLAMA_SERVER_URL),
-            ctx: LlmContext::new(""),
+            ctx: LlmContext::new(xiang_core::SAN_YI_CONSTRAINT_FULL_TEXT),
             messages: vec![],
         }
     }
@@ -40,7 +41,7 @@ impl RawEngine {
     fn generate(&mut self, message: &str) -> Result<RawResponse, String> {
         let result = self
             .ctx
-            .generate_unconstrained_turn(&mut self.backend, message, 200, TemperatureMode::Default)
+            .generate_unconstrained_turn(&mut self.backend, message, 200, TemperatureMode::Default, &[])
             .map_err(|e| format!("生成失败: {e}"))?;
 
         self.messages.push(Message {
@@ -138,6 +139,15 @@ impl ConstrainedEngine {
             eprintln!("[debug] 藏海无历史数据，从空开始");
         }
 
+        // ── 观测层：EmbeddingObserver 注入 ──
+        // 使用空 HanziMap 初始化（降级模式：纯 Hamming 偏离度）。
+        // 当 export_hanzi_embeddings.py 导出真实嵌入数据后，
+        // 切换为 include_bytes!("../data/hanzi_embeddings.bin") 加载。
+        eprintln!("[debug] ConstrainedEngine::new: EmbeddingObserver (空HanziMap降级)...");
+        let hanzi_map = HanziMap::empty();
+        let observer = EmbeddingObserver::new(hanzi_map);
+        vm.embedding_observer = Some(observer);
+
         eprintln!("[debug] ConstrainedEngine::new: ShanVM/ZhouVM...");
         // 创建引擎并注入 CangVM（单一数据源）
         vm.shan_vm = Some(ShanVM::new());
@@ -154,7 +164,7 @@ impl ConstrainedEngine {
         ConstrainedEngine {
             backend,
             cang_vm: vm,
-            ctx: LlmContext::new(""),
+            ctx: LlmContext::new(xiang_core::SAN_YI_CONSTRAINT_FULL_TEXT),
             messages: vec![],
             eos_id: vocab::QWEN_EOS_TOKEN,
             off_focus_ids,
@@ -255,10 +265,33 @@ impl ConstrainedEngine {
             }
         }
 
-        // ── 4b. 系统提示词注入 ──
+        // ── 4b. 系统提示词注入（v3.1：体系全文 + 动态提示词 + 项目上下文）──
         {
+            // 解析 ZhouVM 姿态信息
+            let posture = self.cang_vm.zhou_posture();
+            let (pose_name, pose_desc) = if let Some(idx) = posture.find(" · ") {
+                (&posture[..idx], &posture[idx + 3..])
+            } else {
+                ("坤", "承载")
+            };
+
+            let engine_hint = semantic_injector::EngineHint {
+                operator: operator.clone(),
+                posture_name: pose_name.to_string(),
+                posture_description: pose_desc.to_string(),
+                temperature: temp,
+                deviation: dev,
+                shan_decision: shan_decision
+                    .as_ref()
+                    .map(|d| format!("{} | {} → {}",
+                        if d.activated { "已激活" } else { "未激活" },
+                        d.jia.name(),
+                        d.decision.name())),
+            };
+
             let injection_state = semantic_injector::InjectionState {
                 project_context: Some(self.project_context.section()),
+                engine_state: Some(engine_hint),
             };
             self.ctx.system_prompt = semantic_injector::build_injection(&injection_state);
         }
@@ -268,6 +301,13 @@ impl ConstrainedEngine {
         let guided_message = format!("[{}]\n{}", prefix, message);
 
         // ── 5. Generate with logit bias ──
+        // 算子专属方向引导 token 池（v4.0）
+        // 从 LLM 词表中识别各类 token 的脚本见 scripts/explore_token_pools.py
+        // 当前传空 Vec：通用压制规则仍生效，算子专属引导在 token 池就绪后自动生效
+        let op_static: &str = Box::leak(operator.clone().into_boxed_str());
+        let operator_positive: Vec<u32> = Vec::new(); // TODO: 从词表识别
+        let operator_negative: Vec<u32> = Vec::new(); // TODO: 从词表识别
+
         let result = self
             .ctx
             .generate_constrained_turn(
@@ -281,8 +321,46 @@ impl ConstrainedEngine {
                 self.off_focus_ids.clone(),
                 self.divergent_ids.clone(),
                 self.eos_id,
+                &[],
+                None,  // strategy_bias (chat app doesn't use ShanVM→bias path)
+                op_static,
+                operator_positive,
+                operator_negative,
             )
             .map_err(|e| format!("约束生成失败: {e}"))?;
+
+        // ── 5a. EmbeddingObserver: semantic fingerprint observation ──
+        // 观测层：每步生成后将 LLM 输出嵌入投影为汉字序列。
+        // 首次观测时自动设置锚点（当前嵌入作为 origin）。
+        // HanziMap 为空时降级：observe() 返回 None，semantic_deviation 为 0.0。
+        let mut semantic_fingerprint: Option<Vec<char>> = None;
+        let mut sem_dev_update: Option<f32> = None;
+        if let Some(embedding) = &result.embedding {
+            if let Some(ref mut observer) = self.cang_vm.embedding_observer {
+                // 首次观测：将当前嵌入设为锚点（origin）
+                if !observer.has_origin() {
+                    observer.set_origin(embedding);
+                    eprintln!("[归·观测] 锚点已设置: 维度={}", embedding.len());
+                }
+                observer.observe(embedding);
+                sem_dev_update = Some(observer.semantic_deviation());
+                semantic_fingerprint = Some(observer.fingerprint().to_vec());
+
+                // 调试输出：汉字投影轨迹
+                if observer.fingerprint_len() % 10 == 0 {
+                    let recent: String = observer.recent_fingerprint(5).iter().collect();
+                    eprintln!(
+                        "[归·观测] 汉字轨迹(最近5): {} | 语义偏离: {:.3} | 弱锚定比: {:.2}",
+                        recent,
+                        observer.semantic_deviation(),
+                        observer.weak_anchor_ratio(),
+                    );
+                }
+            }
+        }
+        if let Some(dev) = sem_dev_update {
+            self.cang_vm.set_semantic_deviation(dev);
+        }
 
         // ── 6. Analyzer: compute output quality deviation ──
         let output_dev = analyzer::compute_output_deviation(&result.text);
@@ -323,6 +401,9 @@ impl ConstrainedEngine {
             decision_content,
         );
 
+        // ── 10. 压缩树：检查新陈代谢信号并执行上下文操作 ──
+        self.handle_metabolism_signal(message, &result.text);
+
         // Track in history
         self.messages.push(Message {
             role: "user".into(),
@@ -350,6 +431,8 @@ impl ConstrainedEngine {
                 d.jia.name(),
                 d.decision.name()
             )),
+            semantic_deviation: self.cang_vm.semantic_deviation,
+            semantic_fingerprint,
         })
     }
 
@@ -454,6 +537,109 @@ impl ConstrainedEngine {
     ///   - dev < 0.3 && is_valid → +0.8 (高质量决策)
     ///   - dev < 0.5 && is_valid → +0.5 (可接受)
     ///   - dev >= 0.5 || !is_valid → -0.3 (噪声，将被丢弃)
+    // ── 压缩树：新陈代谢信号处理（v4.0） ────────────────────────
+
+    /// 检查并执行 CangVM 发出的新陈代谢信号。
+    ///
+    /// 杀/止/藏不直接操作上下文——CangVM 只发信号。
+    /// 实际上下文操作由这个函数在主循环中执行。
+    fn handle_metabolism_signal(&mut self, message: &str, response: &str) {
+        let signal = match self.cang_vm.metabolism_signal.take() {
+            Some(s) => s,
+            None => return,
+        };
+
+        eprintln!("[压缩树] 收到新陈代谢信号: {:?}", signal);
+
+        match signal {
+            MetabolismSignal::Sha(rounds) => {
+                self.crop_history(rounds);
+            }
+            MetabolismSignal::Zhi => {
+                self.freeze_context();
+            }
+            MetabolismSignal::Cang { .. } => {
+                // 用当前对话的摘要作为"藏"的保留摘要
+                let summary = self.build_cycle_summary(message, response);
+                self.reset_context(&summary);
+            }
+        }
+    }
+
+    /// 杀：裁剪最近 N 轮对话历史。
+    ///
+    /// 从 self.messages 和 self.ctx.history 中删除最后 N 轮。
+    /// 模型下一轮将"忘记"被裁剪的内容。
+    fn crop_history(&mut self, rounds: u32) {
+        let n = rounds as usize;
+        // 裁剪对话历史（每轮包含 user + assistant = 2 条消息）
+        let msg_remove = (n.min(self.messages.len() / 2)) * 2;
+        for _ in 0..msg_remove {
+            self.messages.pop();
+        }
+        // 裁剪 LLM 上下文历史
+        for _ in 0..n {
+            self.ctx.history.pop();
+        }
+        eprintln!("[压缩树·杀] 裁剪了 {} 轮对话历史 (消息{}条, 历史{}轮)",
+            n, msg_remove, n.min(self.ctx.history.len() + n));
+    }
+
+    /// 止：冻结上下文。
+    ///
+    /// 设置冻结标记——下一轮生成时不再追加新对话。
+    /// 在系统提示词中追加"请基于已有信息做结论"。
+    fn freeze_context(&mut self) {
+        // 在下一轮的系统提示词中追加冻结指令
+        let freeze_text = "\n\n【上下文冻结】请基于已有信息得出结论，不要展开新方向或引入新话题。";
+        self.ctx.system_prompt.push_str(freeze_text);
+        eprintln!("[压缩树·止] 上下文已冻结");
+    }
+
+    /// 藏：清空上下文，保留摘要。
+    ///
+    /// - 保留本轮摘要
+    /// - 清空消息列表和对话历史
+    /// - 新一轮周天从干净的上下文开始
+    fn reset_context(&mut self, summary: &str) {
+        // 记录本轮总览到日志
+        eprintln!("[压缩树·藏] 清空上下文, 保留摘要 ({}字符)", summary.chars().count());
+
+        // 清空对话消息列表
+        self.messages.clear();
+
+        // 清空 LLM 上下文历史
+        self.ctx.history.clear();
+
+        // 如果有 ProjectContext，保存当前摘要
+        if !summary.is_empty() {
+            eprintln!("[压缩树·藏] 留存摘要: {}", &summary[..summary.len().min(100)]);
+        }
+
+        // 重置连山状态
+        self.cang_vm.shan_triggered = false;
+        self.cang_vm.obstruction_count = 0;
+        self.cang_vm.rounds_since_perception = 0;
+        self.cang_vm.reset_phase_state();
+
+        // 重置嵌入观察器（保留锚点）
+        if let Some(ref mut observer) = self.cang_vm.embedding_observer {
+            observer.reset();
+        }
+
+        eprintln!("[压缩树·藏] 上下文已清空，准备下一周天");
+    }
+
+    /// 构建本轮周期的简短摘要。
+    fn build_cycle_summary(&self, message: &str, response: &str) -> String {
+        let msg_short: String = message.chars().take(100).collect();
+        let resp_short: String = response.chars().take(200).collect();
+        format!(
+            "【前序周期摘要】\n用户: {} \n归藏约束输出: {} \n",
+            msg_short, resp_short
+        )
+    }
+
     fn record_decision(&mut self, round: u32, operator: &str, deviation: f32, is_valid: bool, content: String) {
         let reward = if deviation < 0.3 && is_valid {
             0.8
@@ -477,16 +663,17 @@ impl ConstrainedEngine {
         let saved_prompt = std::mem::replace(&mut self.ctx.system_prompt, String::new());
         let saved_history = std::mem::take(&mut self.ctx.history);
 
-        // 注入项目上下文作为系统提示词
+        // 注入项目上下文作为系统提示词（子任务引擎状态为 None，使用对照组模式）
         let injection_state = InjectionState {
             project_context: Some(self.project_context.section()),
+            engine_state: None,
         };
         self.ctx.system_prompt = semantic_injector::build_injection(&injection_state);
 
         // 无约束生成（子任务足够小，无需 Logit-Bias 干预）
         let result = self
             .ctx
-            .generate_unconstrained_turn(&mut self.backend, message, 200, TemperatureMode::Fixed(0.7))
+            .generate_unconstrained_turn(&mut self.backend, message, 200, TemperatureMode::Fixed(0.7), &[])
             .map_err(|e| format!("子任务生成失败: {e}"))?;
 
         // 恢复主对话上下文，丢弃子任务历史
@@ -528,6 +715,8 @@ impl ConstrainedEngine {
                 zhou_posture: self.cang_vm.zhou_posture().to_string(),
                 zhou_temperature: self.cang_vm.zhou_temperature(),
                 shan_decision: Some("拆解分解(降级为单任务)".to_string()),
+                semantic_deviation: self.cang_vm.semantic_deviation,
+                semantic_fingerprint: None,
             });
         }
 
@@ -596,6 +785,8 @@ impl ConstrainedEngine {
             zhou_posture: self.cang_vm.zhou_posture().to_string(),
             zhou_temperature: self.cang_vm.zhou_temperature(),
             shan_decision: Some(format!("拆解分解 → {}个子任务", subtasks.len())),
+            semantic_deviation: self.cang_vm.semantic_deviation,
+            semantic_fingerprint: None,
         })
     }
 }
@@ -720,6 +911,10 @@ struct ConstrainedResponse {
     zhou_temperature: f32,
     /// Last ShanVM decision, if triggered.
     shan_decision: Option<String>,
+    /// 语义偏离度（来自 EmbeddingObserver，=None 表示未启用）
+    semantic_deviation: Option<f32>,
+    /// 语义指纹：最近几个 token 映射到的汉字序列
+    semantic_fingerprint: Option<Vec<char>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -986,6 +1181,7 @@ mod metabolism_simulation {
         // 2. 构建注入状态
         let state = InjectionState {
             project_context: Some(proj_section.clone()),
+            engine_state: None,
         };
 
         // 3. 生成 system prompt
@@ -1420,6 +1616,7 @@ mod metabolism_simulation {
                     let proj_section = engine.project_context.section();
                     let injection_state = semantic_injector::InjectionState {
                         project_context: Some(proj_section),
+                        engine_state: None,
                     };
                     let sys_prompt = semantic_injector::build_injection(&injection_state);
 

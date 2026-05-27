@@ -103,6 +103,9 @@ pub struct GenerationResult {
     /// Whether this generation was truncated due to focus deviation (杀硬逻辑).
     /// When true, the caller should NOT add this turn to history.
     pub deviated: bool,
+    /// Output embedding of the last decoded token position.
+    /// Available when `ctx_params.embeddings = true` and the backend supports it.
+    pub embedding: Option<Vec<f32>>,
 }
 
 #[derive(Debug, Clone)]
@@ -150,27 +153,41 @@ impl std::error::Error for LlmError {}
 
 // ── XiangLogitBias ──────────────────────────────────────────
 
-/// Maps CangVM state (Gua, deviation, sha) to per-token logit bias.
+/// Maps CangVM state (Gua, deviation, sha, operator) to per-token logit bias.
 ///
-/// Uses **continuous intensity scaling** — the bias strength varies smoothly
-/// with deviation rather than jumping at thresholds. This is critical for the
-/// HTTP backend which calls `bias_for_step()` once per generation: the static
-/// bias map must include ALL rule categories with intensity proportional to
-/// deviation.
+/// v4.0 算子差异化升级：
+/// 每个算子（生/动/长/育）有独立的方向引导 token 池，
+/// 将通用"压制"升级为"阶段方向引导"。
 ///
-/// Rules (all always applied, intensity varies with deviation):
-///   - Suppress off-focus tokens:  -0.5 at D=0  →  -8.0 at D=1
-///   - Suppress divergent tokens:  -0.5 at D=0  →  -5.0 at D=1
-///   - Promote EOS:                 0.0 at D=0  →  +4.0 at D=1
-///   - Sha amplification:          -2.0 extra when sha_count > 0
-///   - Force stop:                  D > 0.95 (prevents generation entirely)
+/// 强度上限 ±1.0（v4.0 新增限制）— 方向引导而非内容压制。
+/// 旧版 -8.0 强压制被移除（杀死涌现）。
+///
+/// 通用压制规则（所有算子共有）：
+///   - off_focus bias:  -lerp(0.3, 4.0, deviation)
+///   - divergent bias:  -lerp(0.3, 2.5, deviation)
+///   - EOS promotion:   lerp(0.0, 2.0, deviation) 仅在 sha_count > 0
+///
+/// 算子专属引导规则（v4.0 新增）：
+///   生: +0.5 鼓励探索 token / -0.5 压制结论 token
+///   动: +0.5 鼓励发散 token / -0.5 压制重复 token
+///   长: +0.5 鼓励收敛 token / -0.5 压制新方向 token
+///   育: +0.5 鼓励结构 token / -0.5 压制模糊 token
 pub struct XiangLogitBias {
     pub deviation: f32,
     pub state: Gua,
     pub sha_count: u32,
+    // ── 通用压制 token 池 ──
     pub off_focus_token_group: Vec<u32>,
     pub divergent_token_group: Vec<u32>,
     pub eos_token_id: u32,
+    // ── 算子专属方向引导 token 池（v4.0） ──
+    /// 当前算子名称（"生"/"动"/"长"/"育"）
+    pub operator: &'static str,
+    /// 正向引导 token：被鼓励的 token 获得 +bias
+    pub operator_positive_tokens: Vec<u32>,
+    /// 负向引导 token：被压制的 token 获得 -bias
+    pub operator_negative_tokens: Vec<u32>,
+    // ── 通用状态 ──
     pub bias_log: Vec<BiasLogEntry>,
     /// Hamming-only deviation component (optional, for diagnostic purposes).
     pub hamming_deviation: Option<f32>,
@@ -197,6 +214,9 @@ impl XiangLogitBias {
             off_focus_token_group: off_focus_tokens,
             divergent_token_group: divergent_tokens,
             eos_token_id,
+            operator: "生",  // 默认：无算子信息时使用生算子
+            operator_positive_tokens: Vec::new(),
+            operator_negative_tokens: Vec::new(),
             bias_log: Vec::new(),
             hamming_deviation: None,
             semantic_deviation: None,
@@ -204,51 +224,93 @@ impl XiangLogitBias {
             v_attitude: None,
         }
     }
+
+    /// 设置当前算子名称和方向引导 token 池（v4.0）。
+    pub fn with_operator(mut self, operator: &'static str,
+        positive_tokens: Vec<u32>, negative_tokens: Vec<u32>) -> Self
+    {
+        self.operator = operator;
+        self.operator_positive_tokens = positive_tokens;
+        self.operator_negative_tokens = negative_tokens;
+        self
+    }
+
+    /// Set the 连山 strategy vector for token-level bias modulation.
+    pub fn with_strategy(mut self, v: Option<Vec<f32>>) -> Self {
+        self.v_strategy = v;
+        self
+    }
 }
 
 impl LogitBias for XiangLogitBias {
     fn bias_for_step(&mut self, _step: &LogitStep) -> BiasDirective {
         let mut rules = Vec::new();
 
-        // Force stop at extreme deviation (prevents generation entirely)
-        if self.deviation > 0.95 {
-            return BiasDirective {
-                rules: vec![],
-                temperature: None,
-                force_stop: true,
-            };
-        }
+        // ── 通用压制规则（所有算子共用） ──
+        // v3.5 修复: 强度从 -8.0 降至 -4.0，防止杀死涌现
+        // v4.0: 维持此强度，算子专属引导在下方单独添加
+        let off_focus_bias = -lerp(0.3, 4.0, self.deviation);
+        let divergent_bias = -lerp(0.3, 2.5, self.deviation);
+        let sha_bonus = if self.sha_count > 0 { 1.0 } else { 0.0 };
 
-        // Continuous intensity: bias strength scales smoothly with deviation.
-        // - At dev=0.0: very mild suppression
-        // - At dev=1.0: very strong suppression
-        // - sha_count > 0: additional bias on off_focus (pruning amplification)
-        let off_focus_bias = -lerp(0.5, 8.0, self.deviation);
-        let divergent_bias = -lerp(0.5, 5.0, self.deviation);
-        let eos_bias = lerp(0.0, 4.0, self.deviation);
-        let sha_bonus = if self.sha_count > 0 { 2.0 } else { 0.0 };
-
-        // Always suppress off-focus tokens (if any are configured)
         if !self.off_focus_token_group.is_empty() {
             rules.push(TokenBiasRule {
                 token_ids: self.off_focus_token_group.clone(),
                 bias: off_focus_bias - sha_bonus,
             });
         }
-
-        // Always suppress divergent tokens (if any are configured)
         if !self.divergent_token_group.is_empty() {
             rules.push(TokenBiasRule {
                 token_ids: self.divergent_token_group.clone(),
                 bias: divergent_bias,
             });
         }
+        if self.sha_count > 0 {
+            let eos_bias = lerp(0.0, 2.0, self.deviation);
+            rules.push(TokenBiasRule {
+                token_ids: vec![self.eos_token_id],
+                bias: eos_bias,
+            });
+        }
 
-        // Always promote EOS — stronger when deviation is high
-        rules.push(TokenBiasRule {
-            token_ids: vec![self.eos_token_id],
-            bias: eos_bias,
-        });
+        // ── v4.0 算子专属方向引导规则 ──
+        // 强度上限 ±1.0 — 方向引导而非内容压制
+        // 根据偏离度动态调节：偏离度高时适当加强引导
+        let guide_strength = lerp(0.3, 1.0, self.deviation);
+        if !self.operator_positive_tokens.is_empty() {
+            rules.push(TokenBiasRule {
+                token_ids: self.operator_positive_tokens.clone(),
+                bias: guide_strength,  // +0.3~+1.0 正向引导
+            });
+        }
+        if !self.operator_negative_tokens.is_empty() {
+            rules.push(TokenBiasRule {
+                token_ids: self.operator_negative_tokens.clone(),
+                bias: -guide_strength,  // -0.3~-1.0 负向引导
+            });
+        }
+
+        // ── 连山策略调节（v4.0） ──
+        if let Some(ref v_strategy) = self.v_strategy {
+            if v_strategy.len() >= 3 {
+                if v_strategy[0] > 0.5 {
+                    // PushThrough: 增强正向引导 +0.2
+                    for rule in &mut rules {
+                        if rule.bias > 0.0 && rule.bias <= 1.5 {
+                            rule.bias += 0.2;
+                        }
+                    }
+                }
+                if v_strategy[1] > 0.5 {
+                    // NavigateAround: 增强负向引导 -0.2
+                    for rule in &mut rules {
+                        if rule.bias < 0.0 && rule.bias >= -1.5 {
+                            rule.bias -= 0.2;
+                        }
+                    }
+                }
+            }
+        }
 
         BiasDirective {
             rules,
@@ -262,6 +324,9 @@ impl LogitBias for XiangLogitBias {
             off_focus_token_group: self.off_focus_token_group.clone(),
             divergent_token_group: self.divergent_token_group.clone(),
             eos_token_id: self.eos_token_id, bias_log: self.bias_log.clone(),
+            operator: self.operator,
+            operator_positive_tokens: self.operator_positive_tokens.clone(),
+            operator_negative_tokens: self.operator_negative_tokens.clone(),
             hamming_deviation: self.hamming_deviation,
             semantic_deviation: self.semantic_deviation,
             v_strategy: self.v_strategy.clone(),
@@ -381,7 +446,7 @@ impl LlmBackend for MockBackend {
                 return Ok(GenerationResult {
                     text: self.decode_tokens(&tokens), tokens_generated: i+1, truncated: false,
                     stop_reason: StopReason::Eos, bias_applications: i+1, tokens_suppressed: sup, bias_log: blog,
-                    deviated: false,
+                    deviated: false, embedding: None,
                 });
             }
         }
@@ -389,7 +454,7 @@ impl LlmBackend for MockBackend {
         Ok(GenerationResult {
             text: self.decode_tokens(&tokens), tokens_generated: params.max_tokens, truncated: !deviated,
             stop_reason, bias_applications: params.max_tokens, tokens_suppressed: sup, bias_log: blog,
-            deviated,
+            deviated, embedding: None,
         })
     }
     fn tokenize(&self, _t: &str) -> Vec<u32> { vec![self.vocab.safe_tokens[0]] }
@@ -432,6 +497,12 @@ impl LlmContext {
         user_input: &str, max_tokens: u32, temperature: TemperatureMode,
         vm_state: Gua, deviation: f32, sha_count: u32,
         off_focus_ids: Vec<u32>, divergent_ids: Vec<u32>, eos_id: u32,
+        extra_stop_sequences: &[String],
+        strategy_bias: Option<Vec<f32>>,
+        // ── v4.0 算子差异化参数 ──
+        operator: &'static str,
+        operator_positive_tokens: Vec<u32>,
+        operator_negative_tokens: Vec<u32>,
     ) -> Result<GenerationResult, LlmError> {
         // ── 杀硬逻辑：注入 origin_guidance 引导偏离恢复 ──
         // 若上一轮偏离被物理丢弃，在本次 prompt 前置引导语
@@ -444,11 +515,16 @@ impl LlmContext {
             user_input.to_string()
         };
 
-        let bias = XiangLogitBias::new(deviation, vm_state, sha_count, off_focus_ids, divergent_ids, eos_id);
+        let mut all_stops: Vec<String> = vec!["</s>".into()];
+        all_stops.extend_from_slice(extra_stop_sequences);
+
+        let bias = XiangLogitBias::new(deviation, vm_state, sha_count, off_focus_ids, divergent_ids, eos_id)
+            .with_operator(operator, operator_positive_tokens, operator_negative_tokens)
+            .with_strategy(strategy_bias);
         let mut params = GenerationParams {
             system_prompt: self.system_prompt.clone(), user_input: guided_input,
             history: self.history.clone(), max_tokens, temperature,
-            stop_sequences: vec!["</s>".into()], apply_focus_constraint: deviation > 0.5,
+            stop_sequences: all_stops, apply_focus_constraint: deviation > 0.5,
             vm_state, deviation, logit_bias: Some(Box::new(bias)),
         };
         let r = backend.generate(&mut params)?;
@@ -471,6 +547,7 @@ impl LlmContext {
     pub fn generate_unconstrained_turn<B: LlmBackend>(
         &mut self, backend: &mut B,
         user_input: &str, max_tokens: u32, temperature: TemperatureMode,
+        extra_stop_sequences: &[String],
     ) -> Result<GenerationResult, LlmError> {
         let mut params = GenerationParams {
             system_prompt: self.system_prompt.clone(), user_input: user_input.into(),
@@ -478,6 +555,7 @@ impl LlmContext {
             stop_sequences: vec!["</s>".into()], apply_focus_constraint: false,
             vm_state: Gua::ZERO, deviation: 0.0, logit_bias: None,
         };
+        params.stop_sequences.extend_from_slice(extra_stop_sequences);
         let r = backend.generate(&mut params)?;
         self.total_tokens += r.tokens_generated; self.total_calls += 1;
         self.add_turn(user_input, &r.text);
@@ -498,31 +576,47 @@ mod tests {
     #[test] fn test_low_deviation_has_rules() {
         let mut b = XiangLogitBias::new(0.1, Gua::ORIGIN, 0, vec![100], vec![200], 999);
         let d = b.bias_for_step(&LogitStep::default());
-        // Continuous model always produces rules (EOS promotion at minimum)
+        // v3.5: EOS promotion only when sha_count > 0
         assert!(!d.force_stop, "dev=0.1 should not force stop");
-        assert!(d.rules.iter().any(|r| r.token_ids.contains(&999)),
-            "EOS promotion should always be present");
+        assert!(!d.rules.iter().any(|r| r.token_ids.contains(&999)),
+            "EOS should NOT be present when sha_count=0");
     }
     #[test] fn test_high_deviation_strong_suppression() {
         let mut b = XiangLogitBias::new(0.8, Gua::ZERO, 0, vec![100], vec![200], 999);
         let d = b.bias_for_step(&LogitStep::default());
-        // Should have strong negative bias on off_focus, strong positive on EOS
+        // v3.5: Strong negative bias on off_focus, EOS only when sha_count > 0
         assert!(d.rules.iter().any(|r| r.token_ids.contains(&100) && r.bias < -2.0));
-        assert!(d.rules.iter().any(|r| r.token_ids.contains(&999) && r.bias > 2.0));
+        assert!(!d.rules.iter().any(|r| r.token_ids.contains(&999)),
+            "EOS should NOT be present when sha_count=0");
     }
-    #[test] fn test_extreme_deviation_force_stop() {
-        let mut b = XiangLogitBias::new(0.96, Gua::ZERO, 0, vec![100], vec![200], 999);
-        assert!(b.bias_for_step(&LogitStep::default()).force_stop);
+    #[test] fn test_deviation_one_no_force_stop() {
+        // v3.5: dev=1.0 不触发 force_stop，bias 强度降低
+        let mut b = XiangLogitBias::new(1.0, Gua::ZERO, 0, vec![100], vec![200], 999);
+        let d = b.bias_for_step(&LogitStep::default());
+        assert!(!d.force_stop, "dev=1.0 should NOT force stop (force_stop removed in v3.3)");
+        // off_focus: -lerp(0.3, 4.0, 1.0) = -(0.3 + 3.7*1.0) = -4.0
+        assert!(d.rules.iter().any(|r| r.token_ids.contains(&100) && r.bias <= -3.5));
+        // EOS 仅在 sha_count > 0 时出现
+        assert!(!d.rules.iter().any(|r| r.token_ids.contains(&999)),
+            "EOS should NOT be present when sha_count=0");
+    }
+    #[test] fn test_no_force_stop_at_any_deviation() {
+        // v3.3: force_stop 已完全移除，任何偏离度都不应阻断生成
+        for dev in [0.0_f32, 0.5, 0.95, 0.999, 1.0] {
+            let mut b = XiangLogitBias::new(dev, Gua::ZERO, 0, vec![100], vec![200], 999);
+            let d = b.bias_for_step(&LogitStep::default());
+            assert!(!d.force_stop, "dev={dev} should NOT force stop");
+        }
     }
     #[test] fn test_sha_amplifies() {
         let mut b = XiangLogitBias::new(0.5, Gua::ZERO, 5, vec![100], vec![200], 999);
         let d = b.bias_for_step(&LogitStep::default());
-        // Sha amplification adds -2.0 to off_focus bias
+        // v3.5: sha_bonus = 1.0, off_focus_base = -lerp(0.3, 4.0, 0.5)
         let off_focus_rule = d.rules.iter().find(|r| r.token_ids.contains(&100));
         assert!(off_focus_rule.is_some(), "should have off_focus rule");
-        // At dev=0.5: off_focus_base = -lerp(0.5, 8.0, 0.5) = -(0.5 + 7.5*0.5) = -4.25
-        // With sha_count=5: -4.25 - 2.0 = -6.25
-        let expected = -(0.5 + 7.5 * 0.5) - 2.0;
+        // At dev=0.5: off_focus_base = -lerp(0.3, 4.0, 0.5) = -(0.3 + 3.7*0.5) = -2.15
+        // With sha_count=5: -2.15 - 1.0 = -3.15
+        let expected = -(0.3 + 3.7 * 0.5) - 1.0;
         let actual = off_focus_rule.unwrap().bias;
         assert!((actual - expected).abs() < 0.01,
             "off_focus bias with sha=5 should be {:.2}, got {}", expected, actual);
@@ -581,6 +675,8 @@ mod tests {
             &mut b, "测试", 20, TemperatureMode::Default,
             Gua::ZERO, 0.8, 3,
             off_focus_tok, divergent_tok, eos,
+            &[], None,
+            "生", Vec::new(), Vec::new(),
         ).unwrap();
         assert_eq!(ctx.total_calls, 1);
         assert!(r.tokens_suppressed > 0);
@@ -588,7 +684,7 @@ mod tests {
     #[test] fn test_unconstrained_turn() {
         let mut ctx = LlmContext::new("SYS");
         let mut b = MockBackend::new(MockMode::Safe);
-        let _ = ctx.generate_unconstrained_turn(&mut b, "测试", 10, TemperatureMode::Default).unwrap();
+        let _ = ctx.generate_unconstrained_turn(&mut b, "测试", 10, TemperatureMode::Default, &[]).unwrap();
         assert_eq!(ctx.total_calls, 1);
     }
     #[test] fn test_vocab_decode() {
@@ -628,8 +724,10 @@ mod tests {
             &mut b, "a", 10, TemperatureMode::Default,
             Gua::ZERO, 0.8, 0,
             off_focus_tok, deviating_tok, eos,
+            &[], None,
+            "生", Vec::new(), Vec::new(),
         ).unwrap();
-        ctx.generate_unconstrained_turn(&mut b, "b", 10, TemperatureMode::Default).unwrap();
+        ctx.generate_unconstrained_turn(&mut b, "b", 10, TemperatureMode::Default, &[]).unwrap();
         assert_eq!(ctx.total_calls, 2);
         assert_eq!(ctx.history.len(), 2);
     }

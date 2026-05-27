@@ -3,7 +3,7 @@
 /// Walks the parsed AST and executes eight-qi operators on a 6-bit Gua state vector,
 /// manages the CangSea for Hebbian learning, and tracks deviation from the question focus origin.
 
-use xiang_core::{Gua, CangSea, deviation};
+use xiang_core::{Gua, CangSea, Bagua, deviation, hybrid_deviation};
 use xiang_core::embedding::Embedding;
 use xiang_core::yin_checker::{YinProtocolChecker, RuleResult};
 use xiang_core::LianShanDecision;
@@ -76,6 +76,9 @@ pub struct CangVM {
     pub semantic_deviation: Option<f32>,
     /// Alpha weight for hybrid deviation: alpha*hamming + (1-alpha)*cosine.
     pub deviation_alpha: f32,
+    /// 汉字嵌入观察器——将 LLM 输出嵌入映射为离散汉字，追踪语义偏离度。
+    /// 这是**归**算子的实现：连续向量空间到离散符号空间的观察桥梁。
+    pub embedding_observer: Option<xiang_core::EmbeddingObserver>,
     // ── Three-Engine Integration (三引擎融合) ─────────────
     /// Lianshan strategy engine (discrete 6-step chain).
     /// When present, `LianShanOp` executes the full decision chain.
@@ -112,6 +115,12 @@ pub struct CangVM {
     pub max_total_retries: u32,
     /// 藏海持久化文件路径。设置后，每次执行"藏"算子会自动保存。
     pub cangsea_path: Option<PathBuf>,
+    // ── 上下文新陈代谢（v4.0） ──
+    /// 当前算子执行后发出的上下文管理信号。
+    /// 由 execute_phase_operator() 的杀/止/藏分支设置，
+    /// 外部循环在 judge() 之后检查并消费。
+    /// 消费后应置为 None。
+    pub metabolism_signal: Option<MetabolismSignal>,
 }
 
 impl CangVM {
@@ -149,12 +158,20 @@ impl CangVM {
             max_kills_per_cycle: 3,
             max_total_retries: 5,
             cangsea_path: None,
+            embedding_observer: None,
+            metabolism_signal: None,
         }
     }
 
-    /// Get the current Hamming deviation from the question focus origin.
+    /// Get the current deviation from the question focus origin.
+    ///
+    /// Uses hybrid deviation when semantic deviation is available:
+    ///   hybrid = alpha * hamming + (1 - alpha) * semantic
+    ///
+    /// Falls back to pure Hamming (6-bit Gua distance) when semantic is None.
     pub fn current_deviation(&self) -> f32 {
-        deviation(self.state, self.origin)
+        let hamming = deviation(self.state, self.origin);
+        hybrid_deviation(hamming, self.semantic_deviation, self.deviation_alpha)
     }
 
     /// Dynamically set the origin (question focus) for deviation measurement.
@@ -167,6 +184,19 @@ impl CangVM {
     pub fn set_semantic_origin(&mut self, text: String, embedding: Embedding) {
         self.semantic_origin_text = Some(text);
         self.semantic_origin_embedding = Some(embedding);
+    }
+
+    /// Directly set the semantic deviation value (e.g., from EmbeddingObserver).
+    /// When set, `current_deviation()` will blend Hamming + semantic deviation.
+    pub fn set_semantic_deviation(&mut self, deviation: f32) {
+        self.semantic_deviation = Some(deviation);
+    }
+
+    /// Inject an EmbeddingObserver for LLM output embedding → Chinese character observation.
+    /// This enables the **归** operator's semantic deviation tracking.
+    pub fn with_embedding_observer(mut self, observer: xiang_core::EmbeddingObserver) -> Self {
+        self.embedding_observer = Some(observer);
+        self
     }
 
     // ── Three-Engine Builder Methods (三引擎注入) ──────────
@@ -258,6 +288,67 @@ impl CangVM {
         self.zhou_vm.as_ref()
             .map(|z| z.prompt_prefix())
             .unwrap_or("请给出客观、全面的回应。")
+    }
+
+    /// Select the cognitive posture (Bagua) based on the current state of all three engines.
+    ///
+    /// Priority:
+    /// 1. ShanVM strategy override (if activated)
+    /// 2. High deviation → lock down (艮)
+    /// 3. Medium deviation → break pattern (坎)
+    /// 4. Operator phase → corresponding posture
+    ///
+    /// This replaces the random Markov walk with cognitively-grounded posture selection.
+    pub fn select_zhou_pose(&mut self) {
+        // Extract values BEFORE mutable borrow of zhou_vm
+        let dev = self.current_deviation();
+        let operator = self.current_operator().unwrap_or("生").to_string();
+        let shan_active = self.shan_triggered;
+        let shan_fw = self.last_lian_shan_decision.as_ref().map(|d| d.decision);
+
+        let zhou = match self.zhou_vm.as_mut() {
+            Some(z) => z,
+            None => return,
+        };
+
+        let pose: Bagua = if shan_active {
+            // ── ShanVM strategy overrides posture ──
+            if let Some(fw) = shan_fw {
+                match fw {
+                    xiang_core::FangWei::Decompose => Bagua::巽,      // 渗透, 0.7
+                    xiang_core::FangWei::PushThrough => Bagua::乾,    // 创造, 1.2
+                    xiang_core::FangWei::NavigateAround => Bagua::坎, // 破局, 1.1
+                    xiang_core::FangWei::Abort | xiang_core::FangWei::Escalate => Bagua::艮, // 止定, 0.3
+                    _ => Bagua::坤,                                    // 承载, 0.6
+                }
+            } else {
+                Bagua::坤
+            }
+        } else if dev > 0.7 {
+            // ── High deviation → lock down ──
+            Bagua::艮
+        } else if dev > 0.5 {
+            // ── Medium deviation → break pattern ──
+            Bagua::坎
+        } else {
+            // ── Phase-driven posture ──
+            match operator.as_str() {
+                "生" => Bagua::震, // 启动: initialize exploration
+                "动" => Bagua::乾, // 创造: diverge, brainstorm
+                "长" => Bagua::巽, // 渗透: focus, converge
+                "育" => Bagua::离, // 明照: structure, analyze
+                _ => Bagua::坤,    // 承载: default stable
+            }
+        };
+
+        zhou.execute_pose(pose);
+        self.output_log.push(format!(
+            "[周易·调度] posture={} ({}) temp={:.2} dev={:.2}",
+            zhou.current_pose_name(),
+            zhou.current_posture(),
+            zhou.temperature,
+            dev
+        ));
     }
 
     // ── Phase Constraint Decision Logic (阶段约束) ──────────
@@ -374,8 +465,22 @@ impl CangVM {
             "动" => { self.state = self.state.dong(); Ok(()) }
             "长" => { self.state = self.state.zhang(); Ok(()) }
             "育" => { self.state = self.state.yu(); Ok(()) }
-            "杀" => { self.state = self.state.sha(); self.sha_count += 1; Ok(()) }
-            "止" => { self.state = self.state.zhi(); Ok(()) }
+            "杀" => {
+                self.state = self.state.sha();
+                self.sha_count += 1;
+                // v4.0: 压缩树——发出上下文裁剪信号
+                // 偏离度高时裁 2 轮，否则裁 1 轮
+                let dev = self.current_deviation();
+                let rounds = if dev > 0.7 { 2 } else { 1 };
+                self.metabolism_signal = Some(MetabolismSignal::Sha(rounds));
+                Ok(())
+            }
+            "止" => {
+                self.state = self.state.zhi();
+                // v4.0: 压缩树——发出冻结信号
+                self.metabolism_signal = Some(MetabolismSignal::Zhi);
+                Ok(())
+            }
             "归" => {
                 let dev = self.current_deviation();
                 self.deviation_log.push((self.cycle_count, dev));
@@ -397,6 +502,11 @@ impl CangVM {
                         self.output_log.push(format!("[藏海] 保存失败: {e}"));
                     }
                 }
+                // v4.0: 压缩树——发出清空上下文信号
+                // 外部循环会提取代谢摘要后清空对话历史
+                self.metabolism_signal = Some(MetabolismSignal::Cang {
+                    summary: String::new(), // 由外部循环填充
+                });
                 self.state = self.state.cang();
                 Ok(())
             }
@@ -727,6 +837,30 @@ fn cmp_compare(op: CmpOp, a: f32, b: f32) -> bool {
         CmpOp::Ge => a >= b,
         CmpOp::Le => a <= b,
     }
+}
+
+// ── 上下文新陈代谢信号（v4.0） ──────────────────────────────
+
+/// 压缩树（杀/止/藏）发出的上下文管理信号。
+///
+/// 由 `CangVM::execute_phase_operator()` 在执行杀/止/藏时设置，
+/// 由 `ConstrainedEngine::generate()` 在 judge() 之后检查并执行。
+/// CangVM 不直接操作上下文——它只发信号。
+#[derive(Debug, Clone, PartialEq)]
+pub enum MetabolismSignal {
+    /// 杀 N 轮：从对话历史和 KV cache 中裁剪最近 N 轮内容。
+    /// 参数 = 裁剪轮数（通常为 1-2）。
+    Sha(u32),
+    /// 止：冻结上下文。
+    /// 不再追加新对话轮次（已有的保留），系统提示词追加冻结指令。
+    Zhi,
+    /// 藏：清空上下文。
+    /// 保留本轮代谢摘要，清空消息列表和对话历史。
+    /// 新一轮周天从干净上下文开始。
+    Cang {
+        /// 本轮代谢摘要（从 ContextMetabolism 提取）
+        summary: String,
+    },
 }
 
 /// VM execution errors.

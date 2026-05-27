@@ -15,27 +15,37 @@ use std::time::Duration;
 
 // ── Vocab pattern constants ─────────────────────────────────
 
-/// English text patterns for off-focus token discovery.
-const ENGLISH_PATTERNS: &[&str] = &[
-    "a","b","c","d","e","f","g","h","i","j","k","l","m",
-    "n","o","p","q","r","s","t","u","v","w","x","y","z",
-    "A","B","C","D","E","F","G","H","I","J","K","L","M",
-    "N","O","P","Q","R","S","T","U","V","W","X","Y","Z",
-    "the","and","for","are","but","not","you","all","can",
-    "have","with","this","that","from","they","been","were",
-    "when","what","which","their","about","would","could",
-    "should","there","other","into","than","then","them",
-    "these","some","more","also","very","just","over",
-    "such","each","well","here","where","after","before",
-    "between","through","during","without","because","under",
-    "might","shall","will","must","still","already","even",
-    "first","second","third","last","next","much","many",
-    "Hello","World","This","That","What","How","Why",
-    "English","response","answer","question","please",
-    "sorry","thank","yes","no","maybe","help",
-    "I","you","he","she","we","they","me","him","her",
-    "us","them","my","your","his","its","our","their",
-];
+/// Comprehensive English corpus for off-focus token discovery.
+///
+/// The HTTP backend cannot iterate the full vocabulary, so we tokenize a dense
+/// English text covering diverse vocabulary — common words, technical terms,
+/// academic language — to discover the English-related token IDs the model uses.
+///
+/// BPE tokenization splits words into subword units, so this corpus covers
+/// far more token IDs than the old 80-word pattern list.
+const ENGLISH_CORPUS: &str = "\
+The system processes and analyzes complex data patterns through machine learning algorithms \
+and neural network architectures for generating comprehensive responses about artificial \
+intelligence and deep learning optimization strategies. Information retrieval and natural \
+language understanding require sophisticated tokenization and embedding techniques with \
+attention mechanisms and transformer models. Database management involves structured query \
+processing transaction handling consistency guarantees replication fault tolerance and \
+load balancing across distributed computing environments. Software engineering practices \
+include testing debugging refactoring deployment continuous integration monitoring \
+performance profiling security auditing vulnerability assessment and code review. \
+Cryptographic protocols implement encryption decryption authentication authorization \
+digital signatures key exchange hashing functions and access control mechanisms. \
+Network architecture encompasses routing switching firewalls load balancers proxy servers \
+content delivery edge computing and microservices orchestration with containerization. \
+Scientific computing utilizes numerical methods statistical analysis data visualization \
+hypothesis testing confidence intervals regression classification clustering dimensionality \
+reduction feature engineering model validation and hyperparameter tuning. \
+The fundamental principles of computer science include abstraction encapsulation inheritance \
+polymorphism modularity concurrency parallelism synchronization memory management garbage \
+collection type systems formal verification and program analysis. \
+Critical thinking involves reasoning evaluation interpretation explanation inference \
+deduction induction abduction analysis synthesis comparison contrast critique reflection \
+metacognition problem solving decision making creativity innovation and design thinking.";
 
 /// Chinese transition phrases for divergent token discovery.
 const TRANSITION_PATTERNS: &[&str] = &[
@@ -164,6 +174,9 @@ impl HttpBackend {
 
     /// Scan the model's vocabulary and classify tokens into off-focus and divergent groups.
     /// Results are cached globally (per server URL) to avoid repeated HTTP tokenize requests.
+    ///
+    /// Off-focus tokens: discovered by tokenizing a comprehensive English corpus.
+    /// The corpus covers diverse vocabulary — BPE subword tokenization ensures broad coverage.
     pub fn discover_vocab(&self) -> (Vec<u32>, Vec<u32>) {
         // Check global cache first
         {
@@ -175,14 +188,32 @@ impl HttpBackend {
             }
         }
         // Not cached — scan and store
-        let off_focus = self.scan_vocab_category(ENGLISH_PATTERNS);
+        let off_focus = self.scan_vocab_corpus(ENGLISH_CORPUS);
         let divergent = self.scan_vocab_category(TRANSITION_PATTERNS);
         let result = (off_focus, divergent);
-        // Store in cache (placeholder "in-progress" entry while computing gets overwritten)
+        // Store in cache
         if let Ok(mut cache) = VOCAB_CACHE.lock() {
             cache.insert(self.server_url.clone(), Some(result.clone()));
         }
         result
+    }
+
+    /// Tokenize a corpus string and collect all unique token IDs (excluding EOS).
+    fn scan_vocab_corpus(&self, corpus: &str) -> Vec<u32> {
+        let mut ids = Vec::new();
+        let mut seen = HashSet::new();
+        let eos = self.eos_token_id();
+
+        let tokens = self.tokenize(corpus);
+        for tid in tokens {
+            if tid == eos {
+                continue;
+            }
+            if seen.insert(tid) {
+                ids.push(tid);
+            }
+        }
+        ids
     }
 
     fn scan_vocab_category(&self, patterns: &[&str]) -> Vec<u32> {
@@ -226,6 +257,7 @@ impl LlmBackend for HttpBackend {
                 tokens_suppressed: 0,
                 bias_log: vec![],
                 deviated: false,
+                embedding: None,
             });
         }
 
@@ -288,6 +320,7 @@ impl LlmBackend for HttpBackend {
             tokens_suppressed: 0,
             bias_log: vec![],
             deviated: false,
+            embedding: None,
         })
     }
 
