@@ -208,7 +208,8 @@ All three engines share the same underlying type system (defined in `xiang-core`
 This project is developed and tested on **AMD RX 6650 XT (8GB VRAM)**. Route A (inference-time external constraints) is verified and connected to a real model. However, Route B (LoRA fine-tuning to internalize constraint primitives) is blocked on current hardware:
 
 - 4B QLoRA fine-tuning requires ~7-8GB VRAM, but **no training toolchain is available for AMD on Windows** (bitsandbytes is CUDA-only)
-- Recommended unblocking paths: cloud GPU (Google Colab / AutoDL) or hardware upgrade to ≥16GB VRAM
+- Current strategy: accumulate CangSea training data via Route A, execute Route B when training environment is available.
+- LianShan/ZhouYi pipeline integration has been decoupled from Route B into independent tasks, not blocked by fine-tuning.
 
 See [ARCHITECTURE.md](./ARCHITECTURE.md) for details.
 
@@ -253,8 +254,8 @@ This project is licensed under the **MIT License**. See [LICENSE](LICENSE).
 
 | Area | Description | Difficulty |
 |------|------|:----:|
-| **Route B training pipeline** | Build QLoRA fine-tuning scripts (cloud-first) | ⭐⭐⭐ |
-| **AMD GPU training support** | Resolve bitsandbytes/ROCm compatibility | ⭐⭐⭐⭐ |
+| **Route B training pipeline** | Build QLoRA fine-tuning scripts (external training environment) | ⭐⭐⭐ |
+| **AMD GPU training support** | Resolve training toolchain for AMD ROCm | ⭐⭐⭐⭐ |
 | **ShanVM pipeline integration** | Connect LianShan to CangVM main loop | ⭐⭐ |
 | **ZhouVM pipeline integration** | Connect ZhouYi to CangVM main loop | ⭐⭐ |
 | **CangSea data export** | Export training data as JSONL | ⭐⭐ |

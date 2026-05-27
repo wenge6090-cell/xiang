@@ -25,6 +25,10 @@ benchmark_output/
 # Experiment run output
 experiment_runs/
 
+# Python cache
+__pycache__/
+*.pyc
+
 # Generated files
 tmp_*.json
 
