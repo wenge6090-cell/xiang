@@ -22,6 +22,9 @@ Thumbs.db
 # Benchmark output
 benchmark_output/
 
+# Experiment run output
+experiment_runs/
+
 # Generated files
 tmp_*.json
 

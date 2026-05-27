@@ -1,0 +1,26 @@
+{
+  "wei_diao": {
+    "mean_completion": 0.21746032436688742,
+    "mean_compliance": 0.1376190483570099,
+    "mean_deviation": 0.8305624524752299,
+    "mean_trust": 1.0,
+    "model": "xiang-routeb-0.5b-merged.gguf",
+    "num_trials": 3
+  },
+  "yuan_sheng": {
+    "mean_completion": 0.14761905372142792,
+    "mean_compliance": 0.0915873038272063,
+    "mean_deviation": 0.8552185694376627,
+    "mean_trust": 1.0,
+    "model": "qwen2.5-0.5b-instruct-f16.gguf",
+    "num_trials": 3
+  },
+  "yue_shu": {
+    "mean_completion": 0.16296296566724777,
+    "mean_compliance": 0.14962962766488394,
+    "mean_deviation": 0.8114291429519653,
+    "mean_trust": 1.0,
+    "model": "xiang-routeb-0.5b-merged.gguf",
+    "num_trials": 3
+  }
+}
